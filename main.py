@@ -329,6 +329,47 @@ def wp_rest_search_posts(site_root: str, query: str, per_page: int = 20) -> list
     except Exception:
         return []
 
+def collect_legislature_search_result_links(search_url: str) -> list[str]:
+    """
+    Special-case collector for legislature.mi.gov Search/ExecuteSearch pages.
+    Uses Playwright so the results list fully renders.
+    Returns bill detail links (GetObject?ObjectName=...).
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_timeout(3000)
+
+        # Grab all anchors on the page after render
+        anchors = page.eval_on_selector_all(
+            "a[href]",
+            "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+        )
+        browser.close()
+
+    # Normalize + keep same-domain
+    full_links = []
+    for href in anchors:
+        full = normalize_url(search_url, href)
+        if same_domain(search_url, full):
+            full_links.append(full)
+
+    # De-dupe preserving order
+    seen = set()
+    uniq = []
+    for u in full_links:
+        if u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
+
+    # Keep only bill pages
+    bill_links = [u for u in uniq if "getobject?objectname=" in u.lower()]
+
+    return bill_links[:MAX_LINKS_FROM_HUB]
+
 def is_probable_article_url(u: str) -> bool:
     ul = u.lower()
     path = urlparse(u).path.strip("/")
@@ -445,46 +486,55 @@ def main():
         
             print(f"Hub found: {hub}")
 
-        try:
-            links = collect_links_from_hub(hub)
-            print("Sample hub links:", links[:10])
-        except Exception as e:
-            print(f"Failed to fetch/parse hub page: {e}")
-            continue
+               # Special case: Michigan Legislature bill search pages
+        if "legislature.mi.gov/search/executesearch" in hub.lower():
+            try:
+                content_links = collect_legislature_search_result_links(hub)
+            except Exception as e:
+                print(f"Failed to collect legislature search results: {e}")
+                continue
 
-        # Only keep links that look like actual content pages:
-        # heuristic: exclude the hub itself and keep longer URLs
-        content_links = [u for u in links if u != hub and is_probable_article_url(u)]
-        
-        if not content_links:
-            print("No usable links from hub; trying sitemap fallback...")
-            sitemap_urls = get_urls_from_sitemaps(home)
-    
-                # House Dems URLs often include the member slug or last name in the URL.
-                # Keep this universal: filter by the legislator's slug and/or last name.
-            name_slug = urlparse(home).path.strip("/").lower()  # e.g., "john-fitzgerald"
-            last_name = name.split()[-1].lower()               # e.g., "fitzgerald"
-    
-            candidates = []
-            for u in sitemap_urls:
-                ul = u.lower()
-                if name_slug in ul or last_name in ul:
-                    if is_probable_article_url(u):
-                        candidates.append(u)
-    
-            content_links = candidates[:MAX_LINKS_FROM_HUB]
-            print(f"Sitemap produced {len(content_links)} candidate links.")
+            print(f"Legislature search collector found {len(content_links)} bill link(s).")
 
-        if not content_links:
-            # WordPress REST API fallback (works on many sites even when pages/sitemaps block)
-            print("Sitemap produced 0; trying WordPress REST API search fallback...")
-            last_name = name.split()[-1]
-            api_links = wp_rest_search_posts(home, last_name, per_page=25)
+        # Normal case: press/news hub pages
+        else:
+            try:
+                links = collect_links_from_hub(hub)
+                # Optional: remove this once you're done debugging
+                print("Sample hub links:", links[:10])
+            except Exception as e:
+                print(f"Failed to fetch/parse hub page: {e}")
+                continue
 
-            # Filter to likely articles and keep only same-domain
-            api_links = [u for u in api_links if same_domain(home, u) and is_probable_article_url(u)]
-            content_links = api_links[:MAX_LINKS_FROM_HUB]
-            print(f"REST API produced {len(content_links)} candidate links.")
+            # Keep links that look like actual content pages
+            content_links = [u for u in links if u != hub and is_probable_article_url(u)]
+
+            # If no usable links, try sitemap fallback
+            if not content_links:
+                print("No usable links from hub; trying sitemap fallback...")
+                sitemap_urls = get_urls_from_sitemaps(home)
+
+                name_slug = urlparse(home).path.strip("/").lower()
+                last_name = name.split()[-1].lower()
+
+                candidates = []
+                for u in sitemap_urls:
+                    ul = u.lower()
+                    if name_slug in ul or last_name in ul:
+                        if is_probable_article_url(u):
+                            candidates.append(u)
+
+                content_links = candidates[:MAX_LINKS_FROM_HUB]
+                print(f"Sitemap produced {len(content_links)} candidate links.")
+
+            # If sitemap still produced nothing, try WP REST fallback
+            if not content_links:
+                print("Sitemap produced 0; trying WordPress REST API search fallback...")
+                last_name = name.split()[-1]
+                api_links = wp_rest_search_posts(home, last_name, per_page=25)
+                api_links = [u for u in api_links if same_domain(home, u) and is_probable_article_url(u)]
+                content_links = api_links[:MAX_LINKS_FROM_HUB]
+                print(f"REST API produced {len(content_links)} candidate links.")
         
         # Add unseen links
         added = 0
