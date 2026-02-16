@@ -148,7 +148,7 @@ def find_hub_url(home_url: str) -> str | None:
         if any(k in text for k in HUB_KEYWORDS) or any(k in href_l for k in HUB_KEYWORDS):
             full = normalize_url(home_url, href)
             # keep only same-domain links
-            if same_domain(home_url, full):
+            if same_domain(hub_url, full):
                 candidates.append(full)
 
     # Prefer links that literally contain "press-releases" or "press"
