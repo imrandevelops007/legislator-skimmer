@@ -229,57 +229,72 @@ def read_seenurls(service) -> set[str]:
     return set(r[0].strip() for r in rows if r and r[0].strip())
 
 def is_probable_article_url(u: str) -> bool:
-    """
-    Universal heuristic: keep URLs that look like content pages, not navigation.
-    Designed to allow patterns like /press-releases/<slug>/ while excluding /press-releases/ itself.
-    """
     ul = u.lower()
     path = urlparse(u).path.strip("/")
     if not path:
         return False
 
     segments = [s for s in path.split("/") if s]
+    if not segments:
+        return False
 
-    # Drop obvious non-content schemes/anchors (extra safety)
+    # Reject obvious non-content schemes
     if ul.startswith("mailto:") or ul.startswith("tel:") or "#" in ul:
         return False
 
-    # Drop obvious utility pages (site navigation, not content)
-    bad_contains = [
-        "privacy", "terms", "search", "subscribe", "donate", "contact",
-        "wp-admin", "wp-login"
-    ]
-    if any(b in ul for b in bad_contains):
+    # Reject common utility pages
+    if any(x in ul for x in ("privacy", "terms", "wp-admin", "wp-login")):
         return False
 
-    # Hubs are OK ONLY if they have a second segment (meaning an actual post)
-    hub_roots = {"press-releases", "press", "news", "media", "blog", "updates"}
-
-    # If it's exactly a hub root page, reject it
-    if len(segments) == 1 and segments[0].lower() in hub_roots:
+    # Reject known "section pages" when the URL is exactly that section
+    section_pages = {
+        "meet-your-senator",
+        "press-room",
+        "press-releases",   # hub page only, not /press-releases/<slug>
+        "video",
+        "audio",
+        "photos",
+        "gallery",
+        "roads",
+        "publications",
+        "request-a-congratulatory-certificate",
+        "past-email-newsletters",
+        "district",
+        "contact",
+        "donate",
+        "subscribe",
+        "search",
+    }
+    if len(segments) == 1 and segments[0] in section_pages:
         return False
 
-    # Reject pagination-style pages
+    # Reject pagination
     if "page/" in ul or "paged=" in ul:
         return False
 
-    # Strong signal: date in URL
+    # Keep if it has a date in the URL
     if re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/", ul) or re.search(r"/20\d{2}/\d{1,2}/", ul):
         return True
 
-    # Common CMS signal: ?p=123 or ?id=123
+    # Keep if it has a post-id query pattern
     if re.search(r"[?&]p=\d+", ul) or re.search(r"[?&]id=\d+", ul):
         return True
 
-    # Generic signal: looks like a post slug
-    # If it lives under a hub root, require at least 2 segments (hub + slug)
-    if len(segments) >= 2 and segments[0].lower() in hub_roots:
+    # Keep if it's under a hub root and has a slug
+    hub_roots = {"press-releases", "press", "news", "media", "blog", "updates"}
+    if len(segments) >= 2 and segments[0] in hub_roots:
         slug = segments[-1]
-        return len(slug) >= 6  # looser than before so we don't miss real posts
+        return len(slug) >= 8
 
-    # Otherwise, allow "deep" paths with a slug-like last segment
-    if len(segments) >= 2 and len(segments[-1]) >= 10:
-        return True
+    # Keep common "article word" slugs even if not under a hub root
+    article_words = ("statement", "advisory", "announces", "applauds", "votes", "bill", "funding", "budget")
+    if len(segments) == 1:
+        slug = segments[0]
+        if len(slug) >= 18 and any(w in slug for w in article_words):
+            return True
+        # also allow long slugs in general
+        if len(slug) >= 28:
+            return True
 
     return False
 
