@@ -57,7 +57,7 @@ def sheets_append_values(service, rng: str, rows: list[list[str]]):
 
 
 def fetch_html(url: str) -> str:
-    # 1) Fast attempt: normal HTTP fetch
+    # 1) Try normal HTTP request first (fast path)
     try:
         r = requests.get(
             url,
@@ -72,22 +72,48 @@ def fetch_html(url: str) -> str:
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
-        # If the site blocks bots, we commonly see 403 here
+
+        # If blocked (403), trigger fallback
         if r.status_code == 403:
             raise requests.HTTPError("403 Forbidden", response=r)
+
         r.raise_for_status()
         return r.text
 
     except Exception as e:
-        # 2) Universal fallback: load like a real browser
         print(f"requests fetch failed for {url}: {e} | trying Playwright fallback...")
 
+        # 2) Universal fallback using Playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=60000)
+
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                )
+            )
+
+            # Optional performance boost: block heavy assets
+            def block_heavy(route):
+                if route.request.resource_type in ("image", "media", "font"):
+                    route.abort()
+                else:
+                    route.continue_()
+
+            page.route("**/*", block_heavy)
+
+            # Use DOMContentLoaded instead of networkidle
+            page.goto(url, wait_until="domcontentloaded", timeout=120000)
+
+            # Let dynamic content settle
+            page.wait_for_timeout(2000)
+
             html = page.content()
+
             browser.close()
+
             return html
 
 
