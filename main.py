@@ -228,6 +228,73 @@ def read_seenurls(service) -> set[str]:
     rows = sheets_get_values(service, "SeenURLs!A2:A")
     return set(r[0].strip() for r in rows if r and r[0].strip())
 
+import xml.etree.ElementTree as ET
+
+def get_urls_from_sitemaps(site_root: str, max_child_sitemaps: int = 15) -> list[str]:
+    """
+    Universal fallback: read URLs from common sitemap endpoints.
+    Works well when hub pages block bots.
+    """
+    sitemap_candidates = [
+        "/wp-sitemap.xml",
+        "/sitemap.xml",
+        "/sitemap_index.xml",
+        "/sitemap-index.xml",
+    ]
+
+    def parse_locs(xml_text: str) -> list[str]:
+        root = ET.fromstring(xml_text)
+        locs = []
+        for elem in root.iter():
+            if elem.tag.lower().endswith("loc") and elem.text:
+                locs.append(elem.text.strip())
+        return locs
+
+    all_urls: list[str] = []
+
+    for path in sitemap_candidates:
+        sm_url = urljoin(site_root, path)
+        try:
+            xml_text = fetch_html(sm_url)
+        except Exception as e:
+            print(f"Sitemap fetch failed for {sm_url}: {e}")
+            continue
+
+        if "<urlset" not in xml_text and "<sitemapindex" not in xml_text:
+            continue
+
+        try:
+            locs = parse_locs(xml_text)
+        except Exception as e:
+            print(f"Sitemap parse failed for {sm_url}: {e}")
+            continue
+
+        # If it's a sitemap index, locs are child sitemap URLs
+        if "sitemap" in xml_text and "sitemapindex" in xml_text:
+            for child in locs[:max_child_sitemaps]:
+                try:
+                    child_xml = fetch_html(child)
+                    if "<urlset" in child_xml:
+                        all_urls.extend(parse_locs(child_xml))
+                except Exception:
+                    continue
+        else:
+            all_urls.extend(locs)
+
+        if all_urls:
+            break
+
+    # de-dupe preserving order + same-domain only
+    seen = set()
+    out = []
+    for u in all_urls:
+        if u in seen:
+            continue
+        if same_domain(site_root, u):
+            seen.add(u)
+            out.append(u)
+    return out
+
 def is_probable_article_url(u: str) -> bool:
     ul = u.lower()
     path = urlparse(u).path.strip("/")
@@ -336,7 +403,7 @@ def main():
 
         try:
             links = collect_links_from_hub(hub)
-            print("Sample hub links:", links[:10])
+            #print("Sample hub links:", links[:10])
         except Exception as e:
             print(f"Failed to fetch/parse hub page: {e}")
             continue
@@ -344,6 +411,25 @@ def main():
         # Only keep links that look like actual content pages:
         # heuristic: exclude the hub itself and keep longer URLs
         content_links = [u for u in links if u != hub and is_probable_article_url(u)]
+        
+            if not content_links:
+                print("No usable links from hub; trying sitemap fallback...")
+                sitemap_urls = get_urls_from_sitemaps(home)
+    
+                # House Dems URLs often include the member slug or last name in the URL.
+                # Keep this universal: filter by the legislator's slug and/or last name.
+                name_slug = urlparse(home).path.strip("/").lower()  # e.g., "john-fitzgerald"
+                last_name = name.split()[-1].lower()               # e.g., "fitzgerald"
+    
+                candidates = []
+                for u in sitemap_urls:
+                    ul = u.lower()
+                    if name_slug in ul or last_name in ul:
+                        if is_probable_article_url(u):
+                            candidates.append(u)
+    
+                content_links = candidates[:MAX_LINKS_FROM_HUB]
+                print(f"Sitemap produced {len(content_links)} candidate links.")
 
         # Add unseen links
         added = 0
