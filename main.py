@@ -295,6 +295,40 @@ def get_urls_from_sitemaps(site_root: str, max_child_sitemaps: int = 15) -> list
             out.append(u)
     return out
 
+def wp_rest_search_posts(site_root: str, query: str, per_page: int = 20) -> list[str]:
+    """
+    Universal fallback for WordPress sites:
+    search posts via wp-json REST API and return their canonical links.
+    """
+    api = urljoin(site_root, "/wp-json/wp/v2/posts")
+    params = {"per_page": per_page, "search": query}
+    try:
+        r = requests.get(
+            api,
+            params=params,
+            timeout=25,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        # If blocked, just return empty
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        links = []
+        for item in data:
+            link = item.get("link")
+            if link:
+                links.append(link)
+        return links
+    except Exception:
+        return []
+
 def is_probable_article_url(u: str) -> bool:
     ul = u.lower()
     path = urlparse(u).path.strip("/")
@@ -431,6 +465,17 @@ def main():
             content_links = candidates[:MAX_LINKS_FROM_HUB]
             print(f"Sitemap produced {len(content_links)} candidate links.")
 
+        if not content_links:
+            # WordPress REST API fallback (works on many sites even when pages/sitemaps block)
+            print("Sitemap produced 0; trying WordPress REST API search fallback...")
+            last_name = name.split()[-1]
+            api_links = wp_rest_search_posts(home, last_name, per_page=25)
+
+            # Filter to likely articles and keep only same-domain
+            api_links = [u for u in api_links if same_domain(home, u) and is_probable_article_url(u)]
+            content_links = api_links[:MAX_LINKS_FROM_HUB]
+            print(f"REST API produced {len(content_links)} candidate links.")
+        
         # Add unseen links
         added = 0
         for u in content_links:
