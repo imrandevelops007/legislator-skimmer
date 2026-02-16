@@ -158,16 +158,17 @@ def collect_links_from_hub(hub_url: str) -> list[str]:
 
 
 def read_legislators(service):
-    # Legislators!A2:E = name, website_url, district, tier, last_checked
-    rows = sheets_get_values(service, "Legislators!A2:E")
+    # Legislators!A2:F = name, website_url, district, tier, last_checked, hub_url
+    rows = sheets_get_values(service, "Legislators!A2:F")
     parsed = []
     for r in rows:
         if len(r) < 2:
             continue
         name = r[0].strip()
         website = r[1].strip()
+        hub = r[5].strip() if len(r) >= 6 and r[5].strip() else ""
         if name and website:
-            parsed.append((name, website))
+            parsed.append((name, website, hub))
     return parsed
 
 
@@ -188,21 +189,27 @@ def main():
 
     new_rows = []
 
-    for name, home in legislators:
+    for name, home, hub_override in legislators:
         print(f"\n=== {name} ===")
         print(f"Home: {home}")
 
-        try:
-            hub = find_hub_url(home)
-        except Exception as e:
-            print(f"Failed to fetch/parse homepage: {e}")
-            continue
+        hub = None
 
-        if not hub:
-            print("No hub page found (press/news/blog).")
-            continue
-
-        print(f"Hub found: {hub}")
+        if hub_override:
+            hub = hub_override
+            print(f"Using hub_url from sheet: {hub}")
+        else:
+            try:
+                hub = find_hub_url(home)
+            except Exception as e:
+                print(f"Failed to fetch/parse homepage: {e}")
+                continue
+        
+            if not hub:
+                print("No hub page found (press/news/blog).")
+                continue
+        
+            print(f"Hub found: {hub}")
 
         try:
             links = collect_links_from_hub(hub)
