@@ -412,24 +412,24 @@ def main():
         # heuristic: exclude the hub itself and keep longer URLs
         content_links = [u for u in links if u != hub and is_probable_article_url(u)]
         
-            if not content_links:
-                print("No usable links from hub; trying sitemap fallback...")
-                sitemap_urls = get_urls_from_sitemaps(home)
+        if not content_links:
+            print("No usable links from hub; trying sitemap fallback...")
+            sitemap_urls = get_urls_from_sitemaps(home)
     
                 # House Dems URLs often include the member slug or last name in the URL.
                 # Keep this universal: filter by the legislator's slug and/or last name.
-                name_slug = urlparse(home).path.strip("/").lower()  # e.g., "john-fitzgerald"
-                last_name = name.split()[-1].lower()               # e.g., "fitzgerald"
+            name_slug = urlparse(home).path.strip("/").lower()  # e.g., "john-fitzgerald"
+            last_name = name.split()[-1].lower()               # e.g., "fitzgerald"
     
-                candidates = []
-                for u in sitemap_urls:
-                    ul = u.lower()
-                    if name_slug in ul or last_name in ul:
-                        if is_probable_article_url(u):
-                            candidates.append(u)
+            candidates = []
+            for u in sitemap_urls:
+                ul = u.lower()
+                if name_slug in ul or last_name in ul:
+                    if is_probable_article_url(u):
+                        candidates.append(u)
     
-                content_links = candidates[:MAX_LINKS_FROM_HUB]
-                print(f"Sitemap produced {len(content_links)} candidate links.")
+            content_links = candidates[:MAX_LINKS_FROM_HUB]
+            print(f"Sitemap produced {len(content_links)} candidate links.")
 
         # Add unseen links
         added = 0
