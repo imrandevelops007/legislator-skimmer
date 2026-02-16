@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+lxml
+trafilatura
+google-api-python-client
+google-auth
