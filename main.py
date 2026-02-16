@@ -334,6 +334,7 @@ def main():
 
         try:
             links = collect_links_from_hub(hub)
+            print("Sample hub links:", links[:10])
         except Exception as e:
             print(f"Failed to fetch/parse hub page: {e}")
             continue
