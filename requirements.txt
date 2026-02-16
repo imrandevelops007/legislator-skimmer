@@ -4,3 +4,4 @@ lxml
 trafilatura
 google-api-python-client
 google-auth
+playwright
