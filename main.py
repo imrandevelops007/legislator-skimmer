@@ -295,6 +295,8 @@ def is_probable_article_url(u: str) -> bool:
         # also allow long slugs in general
         if len(slug) >= 28:
             return True
+        if re.search(r"/20\d{2}/\d{2}/\d{2}/", ul):
+            return True
 
     return False
 
@@ -334,7 +336,7 @@ def main():
 
         try:
             links = collect_links_from_hub(hub)
-            print("Sample hub links:", links[:10])
+            #print("Sample hub links:", links[:10])
         except Exception as e:
             print(f"Failed to fetch/parse hub page: {e}")
             continue
