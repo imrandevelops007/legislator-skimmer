@@ -231,43 +231,54 @@ def read_seenurls(service) -> set[str]:
 def is_probable_article_url(u: str) -> bool:
     """
     Universal heuristic: keep URLs that look like content pages, not navigation.
+    Designed to allow patterns like /press-releases/<slug>/ while excluding /press-releases/ itself.
     """
     ul = u.lower()
     path = urlparse(u).path.strip("/")
-    segments = [s for s in path.split("/") if s]
-
-    # Must be on-site and not empty
     if not path:
         return False
 
-    # Drop obvious non-article sections
+    segments = [s for s in path.split("/") if s]
+
+    # Drop obvious non-content schemes/anchors (extra safety)
+    if ul.startswith("mailto:") or ul.startswith("tel:") or "#" in ul:
+        return False
+
+    # Drop obvious utility pages (site navigation, not content)
     bad_contains = [
-        "contact", "donate", "subscribe", "privacy", "terms", "search",
-        "events", "calendar", "staff", "office", "services"
+        "privacy", "terms", "search", "subscribe", "donate", "contact",
+        "wp-admin", "wp-login"
     ]
     if any(b in ul for b in bad_contains):
         return False
 
-    # Drop hub-like pages and pagination
-    bad_exactish = [
-        "press-releases", "press", "news", "media", "blog", "updates"
-    ]
-    if path in bad_exactish or any(path.endswith(x) for x in bad_exactish):
+    # Hubs are OK ONLY if they have a second segment (meaning an actual post)
+    hub_roots = {"press-releases", "press", "news", "media", "blog", "updates"}
+
+    # If it's exactly a hub root page, reject it
+    if len(segments) == 1 and segments[0].lower() in hub_roots:
         return False
+
+    # Reject pagination-style pages
     if "page/" in ul or "paged=" in ul:
         return False
 
-    # Keep if it has a date pattern in the URL
+    # Strong signal: date in URL
     if re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/", ul) or re.search(r"/20\d{2}/\d{1,2}/", ul):
         return True
 
-    # Keep if it has a long-ish slug (common for CMS posts)
-    # Example: /press-releases/some-long-title/
-    if len(segments) >= 2 and len(segments[-1]) >= 12:
+    # Common CMS signal: ?p=123 or ?id=123
+    if re.search(r"[?&]p=\d+", ul) or re.search(r"[?&]id=\d+", ul):
         return True
 
-    # Keep if it has a common "post id" pattern
-    if re.search(r"[?&]p=\d+", ul) or re.search(r"[?&]id=\d+", ul):
+    # Generic signal: looks like a post slug
+    # If it lives under a hub root, require at least 2 segments (hub + slug)
+    if len(segments) >= 2 and segments[0].lower() in hub_roots:
+        slug = segments[-1]
+        return len(slug) >= 6  # looser than before so we don't miss real posts
+
+    # Otherwise, allow "deep" paths with a slug-like last segment
+    if len(segments) >= 2 and len(segments[-1]) >= 10:
         return True
 
     return False
