@@ -335,6 +335,14 @@ def is_probable_article_url(u: str) -> bool:
     if not path:
         return False
 
+    netloc = urlparse(u).netloc.lower()
+    path = urlparse(u).path.lower()
+    
+    # Accept Michigan Legislature bill pages and related document pages
+    if "legislature.mi.gov" in netloc:
+        if "bill" in path or "resolution" in path or "publicact" in path or "legislative" in path:
+            return True
+
     segments = [s for s in path.split("/") if s]
     if not segments:
         return False
@@ -365,6 +373,8 @@ def is_probable_article_url(u: str) -> bool:
         "donate",
         "subscribe",
         "search",
+        "legislativelydirectedspendingitems",
+        "legislativelydirectedspendingitems2025",
     }
     if len(segments) == 1 and segments[0] in section_pages:
         return False
