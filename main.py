@@ -3,6 +3,7 @@ import json
 import re
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
+from playwright.sync_api import sync_playwright
 
 import requests
 from bs4 import BeautifulSoup
@@ -56,13 +57,38 @@ def sheets_append_values(service, rng: str, rows: list[list[str]]):
 
 
 def fetch_html(url: str) -> str:
-    r = requests.get(
-        url,
-        timeout=25,
-        headers={"User-Agent": "MI-SBDC-LegislatorSkimmer/0.1"}
-    )
-    r.raise_for_status()
-    return r.text
+    # 1) Fast attempt: normal HTTP fetch
+    try:
+        r = requests.get(
+            url,
+            timeout=25,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        # If the site blocks bots, we commonly see 403 here
+        if r.status_code == 403:
+            raise requests.HTTPError("403 Forbidden", response=r)
+        r.raise_for_status()
+        return r.text
+
+    except Exception as e:
+        # 2) Universal fallback: load like a real browser
+        print(f"requests fetch failed for {url}: {e} | trying Playwright fallback...")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            html = page.content()
+            browser.close()
+            return html
 
 
 def normalize_url(base: str, href: str) -> str:
