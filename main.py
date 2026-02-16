@@ -228,6 +228,49 @@ def read_seenurls(service) -> set[str]:
     rows = sheets_get_values(service, "SeenURLs!A2:A")
     return set(r[0].strip() for r in rows if r and r[0].strip())
 
+def is_probable_article_url(u: str) -> bool:
+    """
+    Universal heuristic: keep URLs that look like content pages, not navigation.
+    """
+    ul = u.lower()
+    path = urlparse(u).path.strip("/")
+    segments = [s for s in path.split("/") if s]
+
+    # Must be on-site and not empty
+    if not path:
+        return False
+
+    # Drop obvious non-article sections
+    bad_contains = [
+        "contact", "donate", "subscribe", "privacy", "terms", "search",
+        "events", "calendar", "staff", "office", "services"
+    ]
+    if any(b in ul for b in bad_contains):
+        return False
+
+    # Drop hub-like pages and pagination
+    bad_exactish = [
+        "press-releases", "press", "news", "media", "blog", "updates"
+    ]
+    if path in bad_exactish or any(path.endswith(x) for x in bad_exactish):
+        return False
+    if "page/" in ul or "paged=" in ul:
+        return False
+
+    # Keep if it has a date pattern in the URL
+    if re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/", ul) or re.search(r"/20\d{2}/\d{1,2}/", ul):
+        return True
+
+    # Keep if it has a long-ish slug (common for CMS posts)
+    # Example: /press-releases/some-long-title/
+    if len(segments) >= 2 and len(segments[-1]) >= 12:
+        return True
+
+    # Keep if it has a common "post id" pattern
+    if re.search(r"[?&]p=\d+", ul) or re.search(r"[?&]id=\d+", ul):
+        return True
+
+    return False
 
 def main():
     service = get_sheets_service()
@@ -271,7 +314,7 @@ def main():
 
         # Only keep links that look like actual content pages:
         # heuristic: exclude the hub itself and keep longer URLs
-        content_links = [u for u in links if u != hub and len(urlparse(u).path.strip("/")) > 2]
+        content_links = [u for u in links if u != hub and is_probable_article_url(u)]
 
         # Add unseen links
         added = 0
