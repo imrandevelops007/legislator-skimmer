@@ -18,9 +18,8 @@ from google import genai
 SHEET_ID = os.environ["SHEET_ID"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-GEMINI_MODEL = "gemini-1.5-pro"
+GEMINI_MODEL = "gemini-2.0-flash"
 BATCH_SIZE = 10
-
 POLICY_TAGS = [
     "Infrastructure",
     "Small Business",
