@@ -16,7 +16,7 @@ from googleapiclient.discovery import build
 SHEET_ID = os.environ["SHEET_ID"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# How many bill links to collect per legislator per run
+# How many document links to collect per legislator per run
 MAX_LINKS_FROM_HUB = 25
 
 # Legislators columns expected:
@@ -101,6 +101,13 @@ def canonicalize_legislature_url(u: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{clean_query}"
 
 
+def ensure_printer_friendly(url: str) -> str:
+    if "printerfriendly=" in url.lower():
+        return url
+    joiner = "&" if ("?" in url) else "?"
+    return f"{url}{joiner}printerFriendly=true"
+
+
 # =========================
 # Sheet readers
 # =========================
@@ -112,49 +119,43 @@ def read_legislators(service):
     """
     rows = sheets_get_values(service, LEGISLATORS_RANGE)
     parsed: list[tuple[str, str, str]] = []
-
     for r in rows:
         if not r:
             continue
-
         name = (r[0] or "").strip() if len(r) >= 1 else ""
         website = (r[1] or "").strip() if len(r) >= 2 else ""
         hub = (r[5] or "").strip() if len(r) >= 6 else ""
-
-        if not name:
-            continue
-
-        parsed.append((name, website, hub))
-
+        if name:
+            parsed.append((name, website, hub))
     return parsed
 
 
-def read_seenurls(service) -> set[str]:
-    rows = sheets_get_values(service, "SeenURLs!A2:A")
-    return set((r[0] or "").strip() for r in rows if r and (r[0] or "").strip())
+def read_seen_pairs(service) -> set[tuple[str, str]]:
+    """
+    Reads SeenURLs!A2:B and returns a set of (url, legislator_name).
+    This makes "seen" tracking per-legislator instead of global-by-URL.
+    """
+    rows = sheets_get_values(service, "SeenURLs!A2:B")
+    out: set[tuple[str, str]] = set()
+    for r in rows:
+        if not r or len(r) < 2:
+            continue
+        url = (r[0] or "").strip()
+        name = (r[1] or "").strip()
+        if url and name:
+            out.add((url, name))
+    return out
 
 
 # =========================
-# Legislature Search collector (Playwright + regex)
+# Legislature Search collector (Playwright)
 # =========================
 def collect_legislature_search_result_links(search_url: str) -> list[str]:
     """
     Extract bill/resolution detail links from legislature Search/ExecuteSearch pages.
-
-    Why this approach:
-    - The Legislature site sometimes renders results in ways that don't expose all documents
-      as plain <a href="..."> anchors in the DOM.
-    - We therefore scroll to ensure lazy content loads, grab full HTML, then regex out
-      all objectName=... occurrences and build canonical GetObject URLs.
-
-    Returns:
-      De-duped, canonical GetObject URLs (queryID stripped), capped to MAX_LINKS_FROM_HUB.
+    Returns canonical GetObject URLs with queryID stripped.
     """
-
-    # Force printerFriendly=true (more stable for scraping)
-    if "printerfriendly=" not in search_url.lower():
-        joiner = "&" if ("?" in search_url) else "?"
-        search_url = f"{search_url}{joiner}printerFriendly=true"
+    search_url = ensure_printer_friendly(search_url)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -168,35 +169,39 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
 
         page.goto(search_url, wait_until="networkidle", timeout=120000)
 
-        # Scroll to bottom to trigger any lazy rendering
-        prev_height = 0
-        stable_rounds = 0
-        for _ in range(40):  # safety cap
-            height = page.evaluate("() => document.body.scrollHeight")
-            if height == prev_height:
-                stable_rounds += 1
-            else:
-                stable_rounds = 0
-
-            if stable_rounds >= 2:
-                break
-
-            prev_height = height
-            page.evaluate("h => window.scrollTo(0, h)", height)
-            page.wait_for_timeout(500)
+        # Light scroll to encourage any deferred rendering
+        for _ in range(8):
+            page.evaluate("() => window.scrollBy(0, document.body.scrollHeight)")
+            page.wait_for_timeout(250)
 
         html = page.content()
+
+        # Stage A: regex objectName extraction (works even if links aren't normal anchors)
+        obj_names = re.findall(r"objectName=([A-Za-z0-9\-]+)", html, flags=re.IGNORECASE)
+
+        links: list[str] = []
+        if obj_names:
+            for obj in obj_names:
+                u = f"https://www.legislature.mi.gov/Home/GetObject?objectName={obj}"
+                links.append(canonicalize_legislature_url(u))
+
+        # Stage B: fallback to anchor href extraction if regex yields nothing
+        if not links:
+            hrefs = page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+            )
+            for href in hrefs:
+                full = normalize_url(page.url, href)
+                if not same_domain(page.url, full):
+                    continue
+                ul = full.lower()
+                if "/home/getobject" in ul and "objectname=" in ul:
+                    links.append(canonicalize_legislature_url(full))
+
         browser.close()
 
-    # Regex extract all objectName values (works even if not <a href>)
-    obj_names = re.findall(r"objectName=([A-Za-z0-9\-]+)", html, flags=re.IGNORECASE)
-
-    links: list[str] = []
-    for obj in obj_names:
-        u = f"https://www.legislature.mi.gov/Home/GetObject?objectName={obj}"
-        links.append(canonicalize_legislature_url(u))
-
-    # De-dupe preserving order
+    # de-dupe preserving order
     seen = set()
     uniq: list[str] = []
     for u in links:
@@ -214,10 +219,12 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
 def main():
     service = get_sheets_service()
     legislators = read_legislators(service)
-    seen_urls = read_seenurls(service)
+
+    # Per-legislator seen tracking
+    seen_pairs = read_seen_pairs(service)
 
     now = datetime.now(timezone.utc).isoformat()
-    print(f"Found {len(legislators)} legislator(s). Already seen {len(seen_urls)} URL(s).")
+    print(f"Found {len(legislators)} legislator(s). Already seen {len(seen_pairs)} (url,name) pair(s).")
 
     new_seen_rows: list[list[str]] = []
     new_activity_rows: list[list[str]] = []
@@ -227,13 +234,14 @@ def main():
 
         hub = (hub_override or "").strip()
         if not hub:
-            print("No hub_url provided in Legislators!F. Skipping (bill-only mode).")
+            print("No hub_url provided. Skipping (bill-only mode).")
             continue
 
         if "legislature.mi.gov/search/executesearch" not in hub.lower():
-            print(f"Hub is not a legislature ExecuteSearch URL. Skipping: {hub}")
+            print("Hub is not a legislature Search/ExecuteSearch URL. Skipping (bill-only mode).")
             continue
 
+        hub = ensure_printer_friendly(hub)
         print(f"Using legislature ExecuteSearch hub_url: {hub}")
 
         try:
@@ -245,17 +253,20 @@ def main():
 
         added = 0
         for u in bill_links:
-            # Safety: enforce bills only
+            # Safety: enforce legislature GetObject only
             ul = u.lower()
             if "/home/getobject" not in ul or "objectname=" not in ul:
                 continue
 
-            if u in seen_urls:
+            key = (u, name)
+            if key in seen_pairs:
                 continue
 
+            # SeenURLs per legislator
             new_seen_rows.append([u, name, now])
-            seen_urls.add(u)
+            seen_pairs.add(key)
 
+            # Activity_Items per legislator
             new_activity_rows.append([u, name, "bill", now, "", "", ""])
             added += 1
 
@@ -264,7 +275,7 @@ def main():
     sheets_append_values(service, SEENURLS_RANGE_APPEND, new_seen_rows)
     sheets_append_values(service, ACTIVITY_RANGE_APPEND, new_activity_rows)
 
-    print(f"\nAppended {len(new_seen_rows)} new URL(s) to SeenURLs.")
+    print(f"\nAppended {len(new_seen_rows)} new row(s) to SeenURLs.")
     print(f"Appended {len(new_activity_rows)} new row(s) to Activity_Items.")
 
 
