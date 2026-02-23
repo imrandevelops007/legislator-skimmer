@@ -1,31 +1,46 @@
 import os
 import json
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
-from playwright.sync_api import sync_playwright
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 
+# =========================
+# Config
+# =========================
 SHEET_ID = os.environ["SHEET_ID"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Universal-ish keywords to find a "hub" page on a legislator site
 HUB_KEYWORDS = [
     "press", "press-releases", "press releases",
     "news", "media", "updates", "blog", "articles", "releases"
 ]
 
-# When on a hub page, we will collect links that look like posts
-# (this stays generic: we'll just grab a bunch and filter by domain + uniqueness)
 MAX_LINKS_FROM_HUB = 25
 
+# Activity_Items columns:
+# A url
+# B legislator_name
+# C source_type
+# D captured_at
+# E title (blank for now)
+# F summary (blank for now)
+# G issue_tags (blank for now)
+ACTIVITY_RANGE_APPEND = "Activity_Items!A:G"
+SEENURLS_RANGE_APPEND = "SeenURLs!A:C"
 
+
+# =========================
+# Google Sheets helpers
+# =========================
 def get_sheets_service():
     sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     info = json.loads(sa_json)
@@ -56,8 +71,39 @@ def sheets_append_values(service, rng: str, rows: list[list[str]]):
     ).execute()
 
 
+# =========================
+# URL + fetch helpers
+# =========================
+def normalize_url(base: str, href: str) -> str:
+    return urljoin(base, href)
+
+
+def same_domain(a: str, b: str) -> bool:
+    return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+
+
+def is_legislature_url(u: str) -> bool:
+    return "legislature.mi.gov" in urlparse(u).netloc.lower()
+
+
+def canonicalize_legislature_url(u: str) -> str:
+    """
+    Remove tracking params like queryID from GetObject URLs.
+    Keeps only objectName.
+    """
+    parsed = urlparse(u)
+    q = parsed.query
+    m = re.search(r"(objectname=[^&]+)", q, flags=re.IGNORECASE)
+    if not m:
+        return u
+    clean_query = m.group(1)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{clean_query}"
+
+
 def fetch_html(url: str) -> str:
-    # 1) Try normal HTTP request first (fast path)
+    """
+    Try requests first; if blocked or fails, fall back to Playwright.
+    """
     try:
         r = requests.get(
             url,
@@ -72,21 +118,15 @@ def fetch_html(url: str) -> str:
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
-
-        # If blocked (403), trigger fallback
         if r.status_code == 403:
             raise requests.HTTPError("403 Forbidden", response=r)
-
         r.raise_for_status()
         return r.text
-
     except Exception as e:
         print(f"requests fetch failed for {url}: {e} | trying Playwright fallback...")
 
-        # 2) Universal fallback using Playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-
             page = browser.new_page(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -95,7 +135,7 @@ def fetch_html(url: str) -> str:
                 )
             )
 
-            # Optional performance boost: block heavy assets
+            # Avoid heavy resources
             def block_heavy(route):
                 if route.request.resource_type in ("image", "media", "font"):
                     route.abort()
@@ -104,87 +144,154 @@ def fetch_html(url: str) -> str:
 
             page.route("**/*", block_heavy)
 
-            # Use DOMContentLoaded instead of networkidle
             page.goto(url, wait_until="domcontentloaded", timeout=120000)
-
-            # Let dynamic content settle
             page.wait_for_timeout(2000)
 
             html = page.content()
-
             browser.close()
-
             return html
 
 
-def normalize_url(base: str, href: str) -> str:
-    return urljoin(base, href)
+# =========================
+# Sheet readers
+# =========================
+def read_legislators(service):
+    """
+    Reads Legislators tab.
+    Expected columns (A-F):
+      A name
+      B website_url
+      ...
+      F hub_url (optional override)
+
+    Returns list of tuples: (name, website_url, hub_url_or_blank)
+    """
+    rows = sheets_get_values(service, "Legislators!A2:F")
+    parsed = []
+    for r in rows:
+        if len(r) < 2:
+            continue
+        name = (r[0] or "").strip()
+        website = (r[1] or "").strip()
+        hub = (r[5] or "").strip() if len(r) >= 6 else ""
+        if name and website:
+            parsed.append((name, website, hub))
+    return parsed
 
 
-def same_domain(a: str, b: str) -> bool:
-    return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+def read_seenurls(service) -> set[str]:
+    rows = sheets_get_values(service, "SeenURLs!A2:A")
+    return set((r[0] or "").strip() for r in rows if r and (r[0] or "").strip())
 
 
+# =========================
+# Hub discovery + link heuristics
+# =========================
 def find_hub_url(home_url: str) -> str | None:
-    """
-    Universal discovery:
-    - fetch homepage
-    - scan <a href> for likely hub pages (press/news/blog)
-    - return the best-looking candidate
-    """
     html = fetch_html(home_url)
     soup = BeautifulSoup(html, "lxml")
 
     candidates: list[str] = []
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
+        href = (a.get("href") or "").strip()
         text = (a.get_text(" ", strip=True) or "").lower()
         href_l = href.lower()
-
         if not href:
             continue
 
-        # Basic keyword match on link text OR URL path
         if any(k in text for k in HUB_KEYWORDS) or any(k in href_l for k in HUB_KEYWORDS):
             full = normalize_url(home_url, href)
-            # keep only same-domain links
-            if same_domain(hub_url, full):
+            if same_domain(home_url, full):
                 candidates.append(full)
 
-    # Prefer links that literally contain "press-releases" or "press"
     preferred = [c for c in candidates if "press" in c.lower()]
     if preferred:
-        # choose the shortest (often the hub page, not a specific article)
         return sorted(set(preferred), key=len)[0]
-
     if candidates:
         return sorted(set(candidates), key=len)[0]
-
     return None
 
 
+def is_probable_article_url(u: str) -> bool:
+    ul = u.lower()
+    path = urlparse(u).path.strip("/")
+    if not path:
+        return False
+
+    if ul.startswith("mailto:") or ul.startswith("tel:") or "#" in ul:
+        return False
+    if any(x in ul for x in ("privacy", "terms", "wp-admin", "wp-login")):
+        return False
+
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return False
+
+    # Block common section pages (not content)
+    section_pages = {
+        "meet-your-senator",
+        "press-room",
+        "press-releases",
+        "video",
+        "audio",
+        "photos",
+        "gallery",
+        "roads",
+        "publications",
+        "request-a-congratulatory-certificate",
+        "past-email-newsletters",
+        "district",
+        "contact",
+        "donate",
+        "subscribe",
+        "search",
+        "events",
+        "resources",
+        "bills",
+        "media",
+        "newsletters",
+    }
+    if len(segments) == 1 and segments[0].lower() in section_pages:
+        return False
+
+    if "page/" in ul or "paged=" in ul:
+        return False
+
+    # Strong signal: date in URL
+    if re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/", ul):
+        return True
+
+    # WordPress id patterns
+    if re.search(r"[?&]p=\d+", ul) or re.search(r"[?&]id=\d+", ul):
+        return True
+
+    # Hub-like root + slug
+    hub_roots = {"press-releases", "press", "news", "blog", "updates"}
+    if len(segments) >= 2 and segments[0].lower() in hub_roots:
+        slug = segments[-1]
+        return len(slug) >= 8
+
+    # Long single-segment slugs often are posts
+    if len(segments) == 1 and len(segments[0]) >= 28:
+        return True
+
+    return False
+
+
 def collect_links_from_hub(hub_url: str) -> list[str]:
-    """
-    Generic collection:
-    - fetch hub page
-    - collect a bunch of same-domain links
-    - de-duplicate
-    - remove obvious non-content links
-    """
     html = fetch_html(hub_url)
     soup = BeautifulSoup(html, "lxml")
 
     links: list[str] = []
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
+        href = (a.get("href") or "").strip()
         if not href:
             continue
         full = normalize_url(hub_url, href)
-        if not same_domain(hub_url, full):
-            continue
-        links.append(full)
+        if same_domain(hub_url, full):
+            links.append(full)
 
-    # de-dupe while preserving order
+    # de-dupe preserving order
     seen = set()
     uniq = []
     for u in links:
@@ -193,48 +300,25 @@ def collect_links_from_hub(hub_url: str) -> list[str]:
         seen.add(u)
         uniq.append(u)
 
-    # filter out junk
+    # remove obvious junk
     junk_patterns = [
         r"#", r"mailto:", r"tel:",
         r"/wp-admin", r"/wp-login", r"/privacy", r"/terms",
         r"/contact", r"/donate", r"/subscribe", r"/search"
     ]
 
-    def is_junk(u: str) -> bool:
-        ul = u.lower()
-        return any(re.search(p, ul) for p in junk_patterns)
+    def is_junk(x: str) -> bool:
+        xl = x.lower()
+        return any(re.search(p, xl) for p in junk_patterns)
 
     cleaned = [u for u in uniq if not is_junk(u)]
-
     return cleaned[:MAX_LINKS_FROM_HUB]
 
 
-def read_legislators(service):
-    # Legislators!A2:F = name, website_url, district, tier, last_checked, hub_url
-    rows = sheets_get_values(service, "Legislators!A2:F")
-    parsed = []
-    for r in rows:
-        if len(r) < 2:
-            continue
-        name = r[0].strip()
-        website = r[1].strip()
-        hub = r[5].strip() if len(r) >= 6 and r[5].strip() else ""
-        if name and website:
-            parsed.append((name, website, hub))
-    return parsed
-
-
-def read_seenurls(service) -> set[str]:
-    rows = sheets_get_values(service, "SeenURLs!A2:A")
-    return set(r[0].strip() for r in rows if r and r[0].strip())
-
-import xml.etree.ElementTree as ET
-
+# =========================
+# Sitemaps + WP REST fallback
+# =========================
 def get_urls_from_sitemaps(site_root: str, max_child_sitemaps: int = 15) -> list[str]:
-    """
-    Universal fallback: read URLs from common sitemap endpoints.
-    Works well when hub pages block bots.
-    """
     sitemap_candidates = [
         "/wp-sitemap.xml",
         "/sitemap.xml",
@@ -269,8 +353,7 @@ def get_urls_from_sitemaps(site_root: str, max_child_sitemaps: int = 15) -> list
             print(f"Sitemap parse failed for {sm_url}: {e}")
             continue
 
-        # If it's a sitemap index, locs are child sitemap URLs
-        if "sitemap" in xml_text and "sitemapindex" in xml_text:
+        if "sitemapindex" in xml_text:
             for child in locs[:max_child_sitemaps]:
                 try:
                     child_xml = fetch_html(child)
@@ -284,7 +367,7 @@ def get_urls_from_sitemaps(site_root: str, max_child_sitemaps: int = 15) -> list
         if all_urls:
             break
 
-    # de-dupe preserving order + same-domain only
+    # same-domain only + de-dupe
     seen = set()
     out = []
     for u in all_urls:
@@ -295,11 +378,8 @@ def get_urls_from_sitemaps(site_root: str, max_child_sitemaps: int = 15) -> list
             out.append(u)
     return out
 
+
 def wp_rest_search_posts(site_root: str, query: str, per_page: int = 20) -> list[str]:
-    """
-    Universal fallback for WordPress sites:
-    search posts via wp-json REST API and return their canonical links.
-    """
     api = urljoin(site_root, "/wp-json/wp/v2/posts")
     params = {"per_page": per_page, "search": query}
     try:
@@ -316,7 +396,6 @@ def wp_rest_search_posts(site_root: str, query: str, per_page: int = 20) -> list
                 "Accept": "application/json,text/plain,*/*",
             },
         )
-        # If blocked, just return empty
         if r.status_code != 200:
             return []
         data = r.json()
@@ -329,34 +408,34 @@ def wp_rest_search_posts(site_root: str, query: str, per_page: int = 20) -> list
     except Exception:
         return []
 
+
+# =========================
+# Legislature Search (Playwright)
+# =========================
 def collect_legislature_search_result_links(search_url: str) -> list[str]:
     """
-    Special-case collector for legislature.mi.gov Search/ExecuteSearch pages.
-    Uses Playwright so the results list fully renders.
-    Returns bill detail links (GetObject?ObjectName=...).
+    Extract bill/resolution detail links from legislature Search/ExecuteSearch pages.
+    Returns canonical GetObject URLs with queryID stripped.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-
         page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(3000)
 
-        # Grab all anchors on the page after render
-        anchors = page.eval_on_selector_all(
+        hrefs = page.eval_on_selector_all(
             "a[href]",
             "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
         )
         browser.close()
 
-    # Normalize + keep same-domain
     full_links = []
-    for href in anchors:
+    for href in hrefs:
         full = normalize_url(search_url, href)
         if same_domain(search_url, full):
             full_links.append(full)
 
-    # De-dupe preserving order
+    # de-dupe preserving order
     seen = set()
     uniq = []
     for u in full_links:
@@ -365,111 +444,34 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
         seen.add(u)
         uniq.append(u)
 
-    # Keep only bill pages
-    bill_links = [u for u in uniq if "getobject?objectname=" in u.lower()]
+    bill_links = []
+    for u in uniq:
+        ul = u.lower()
+        if "/home/getobject" in ul and "objectname=" in ul:
+            bill_links.append(canonicalize_legislature_url(u))
 
     return bill_links[:MAX_LINKS_FROM_HUB]
 
-def is_probable_article_url(u: str) -> bool:
-    ul = u.lower()
-    path = urlparse(u).path.strip("/")
-    if not path:
-        return False
 
-    netloc = urlparse(u).netloc.lower()
-    path = urlparse(u).path.lower()
-    
-    # Accept Michigan Legislature bill pages and related document pages
-    if "legislature.mi.gov" in netloc:
-        if "bill" in path or "resolution" in path or "publicact" in path or "legislative" in path:
-            return True
-
-    segments = [s for s in path.split("/") if s]
-    if not segments:
-        return False
-
-    # Reject obvious non-content schemes
-    if ul.startswith("mailto:") or ul.startswith("tel:") or "#" in ul:
-        return False
-
-    # Reject common utility pages
-    if any(x in ul for x in ("privacy", "terms", "wp-admin", "wp-login")):
-        return False
-
-    # Reject known "section pages" when the URL is exactly that section
-    section_pages = {
-        "meet-your-senator",
-        "press-room",
-        "press-releases",   # hub page only, not /press-releases/<slug>
-        "video",
-        "audio",
-        "photos",
-        "gallery",
-        "roads",
-        "publications",
-        "request-a-congratulatory-certificate",
-        "past-email-newsletters",
-        "district",
-        "contact",
-        "donate",
-        "subscribe",
-        "search",
-        "legislativelydirectedspendingitems",
-        "legislativelydirectedspendingitems2025",
-    }
-    if len(segments) == 1 and segments[0] in section_pages:
-        return False
-
-    # Reject pagination
-    if "page/" in ul or "paged=" in ul:
-        return False
-
-    # Keep if it has a date in the URL
-    if re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/", ul) or re.search(r"/20\d{2}/\d{1,2}/", ul):
-        return True
-
-    # Keep if it has a post-id query pattern
-    if re.search(r"[?&]p=\d+", ul) or re.search(r"[?&]id=\d+", ul):
-        return True
-
-    # Keep if it's under a hub root and has a slug
-    hub_roots = {"press-releases", "press", "news", "media", "blog", "updates"}
-    if len(segments) >= 2 and segments[0] in hub_roots:
-        slug = segments[-1]
-        return len(slug) >= 8
-
-    # Keep common "article word" slugs even if not under a hub root
-    article_words = ("statement", "advisory", "announces", "applauds", "votes", "bill", "funding", "budget")
-    if len(segments) == 1:
-        slug = segments[0]
-        if len(slug) >= 18 and any(w in slug for w in article_words):
-            return True
-        # also allow long slugs in general
-        if len(slug) >= 28:
-            return True
-        if re.search(r"/20\d{2}/\d{2}/\d{2}/", ul):
-            return True
-
-    return False
-
+# =========================
+# Main
+# =========================
 def main():
     service = get_sheets_service()
-
     legislators = read_legislators(service)
     seen_urls = read_seenurls(service)
 
     now = datetime.now(timezone.utc).isoformat()
-
     print(f"Found {len(legislators)} legislator(s). Already seen {len(seen_urls)} URL(s).")
 
-    new_rows = []
+    new_seen_rows = []
+    new_activity_rows = []
 
     for name, home, hub_override in legislators:
         print(f"\n=== {name} ===")
         print(f"Home: {home}")
 
-        hub = None
-
+        # Pick hub URL
         if hub_override:
             hub = hub_override
             print(f"Using hub_url from sheet: {hub}")
@@ -479,77 +481,87 @@ def main():
             except Exception as e:
                 print(f"Failed to fetch/parse homepage: {e}")
                 continue
-        
+
             if not hub:
                 print("No hub page found (press/news/blog).")
                 continue
-        
+
             print(f"Hub found: {hub}")
 
-               # Special case: Michigan Legislature bill search pages
-        if "legislature.mi.gov/search/executesearch" in hub.lower():
-            try:
+        # Collect content links
+        try:
+            if "legislature.mi.gov/search/executesearch" in hub.lower():
                 content_links = collect_legislature_search_result_links(hub)
-            except Exception as e:
-                print(f"Failed to collect legislature search results: {e}")
-                continue
-
-            print(f"Legislature search collector found {len(content_links)} bill link(s).")
-
-        # Normal case: press/news hub pages
-        else:
-            try:
+                print(f"Legislature search collector found {len(content_links)} bill link(s).")
+            else:
                 links = collect_links_from_hub(hub)
-                # Optional: remove this once you're done debugging
-                print("Sample hub links:", links[:10])
-            except Exception as e:
-                print(f"Failed to fetch/parse hub page: {e}")
-                continue
+                content_links = [u for u in links if u != hub and is_probable_article_url(u)]
 
-            # Keep links that look like actual content pages
-            content_links = [u for u in links if u != hub and is_probable_article_url(u)]
+                if not content_links:
+                    print("No usable links from hub; trying sitemap fallback...")
+                    sitemap_urls = get_urls_from_sitemaps(home)
 
-            # If no usable links, try sitemap fallback
-            if not content_links:
-                print("No usable links from hub; trying sitemap fallback...")
-                sitemap_urls = get_urls_from_sitemaps(home)
+                    name_slug = urlparse(home).path.strip("/").lower()
+                    last_name = name.split()[-1].lower()
 
-                name_slug = urlparse(home).path.strip("/").lower()
-                last_name = name.split()[-1].lower()
+                    candidates = []
+                    for u in sitemap_urls:
+                        ul = u.lower()
+                        if name_slug in ul or last_name in ul:
+                            if is_probable_article_url(u):
+                                candidates.append(u)
 
-                candidates = []
-                for u in sitemap_urls:
-                    ul = u.lower()
-                    if name_slug in ul or last_name in ul:
-                        if is_probable_article_url(u):
-                            candidates.append(u)
+                    content_links = candidates[:MAX_LINKS_FROM_HUB]
+                    print(f"Sitemap produced {len(content_links)} candidate links.")
 
-                content_links = candidates[:MAX_LINKS_FROM_HUB]
-                print(f"Sitemap produced {len(content_links)} candidate links.")
+                if not content_links:
+                    print("Sitemap produced 0; trying WordPress REST API search fallback...")
+                    last_name = name.split()[-1]
+                    api_links = wp_rest_search_posts(home, last_name, per_page=25)
+                    api_links = [u for u in api_links if same_domain(home, u) and is_probable_article_url(u)]
+                    content_links = api_links[:MAX_LINKS_FROM_HUB]
+                    print(f"REST API produced {len(content_links)} candidate links.")
 
-            # If sitemap still produced nothing, try WP REST fallback
-            if not content_links:
-                print("Sitemap produced 0; trying WordPress REST API search fallback...")
-                last_name = name.split()[-1]
-                api_links = wp_rest_search_posts(home, last_name, per_page=25)
-                api_links = [u for u in api_links if same_domain(home, u) and is_probable_article_url(u)]
-                content_links = api_links[:MAX_LINKS_FROM_HUB]
-                print(f"REST API produced {len(content_links)} candidate links.")
-        
-        # Add unseen links
+        except Exception as e:
+            print(f"Failed to fetch/parse hub page: {e}")
+            continue
+
+        # Canonicalize legislature URLs defensively (even if they slipped in)
+        canon_links = []
+        for u in content_links:
+            if is_legislature_url(u) and "objectname=" in u.lower():
+                canon_links.append(canonicalize_legislature_url(u))
+            else:
+                canon_links.append(u)
+        content_links = canon_links
+
+        # Add unseen links to SeenURLs + Activity_Items
         added = 0
         for u in content_links:
             if u in seen_urls:
                 continue
-            new_rows.append([u, name, now])
+
+            # SeenURLs log
+            new_seen_rows.append([u, name, now])
             seen_urls.add(u)
+
+            # Activity_Items row (blank title/summary/tags for analyzer to fill later)
+            if is_legislature_url(u) and "objectname=" in u.lower():
+                source_type = "bill"
+            else:
+                source_type = "press"
+
+            new_activity_rows.append([u, name, source_type, now, "", "", ""])
             added += 1
 
         print(f"Collected {len(content_links)} candidate links; added {added} new.")
 
-    # Write new rows to SeenURLs
-    sheets_append_values(service, "SeenURLs!A:C", new_rows)
-    print(f"\nAppended {len(new_rows)} new URL(s) to SeenURLs.")
+    # Write outputs
+    sheets_append_values(service, SEENURLS_RANGE_APPEND, new_seen_rows)
+    sheets_append_values(service, ACTIVITY_RANGE_APPEND, new_activity_rows)
+
+    print(f"\nAppended {len(new_seen_rows)} new URL(s) to SeenURLs.")
+    print(f"Appended {len(new_activity_rows)} new row(s) to Activity_Items.")
 
 
 if __name__ == "__main__":
