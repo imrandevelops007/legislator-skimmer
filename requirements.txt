@@ -1,7 +1,8 @@
-requests
-beautifulsoup4
-lxml
-trafilatura
 google-api-python-client
 google-auth
+google-auth-httplib2
+google-auth-oauthlib
+google-genai
+beautifulsoup4
+requests
 playwright
