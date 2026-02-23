@@ -4,7 +4,6 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
-import requests
 from playwright.sync_api import sync_playwright
 
 from google.oauth2.service_account import Credentials
@@ -111,15 +110,21 @@ def read_legislators(service):
     Returns list of tuples: (name, website_url, hub_url_or_blank)
     """
     rows = sheets_get_values(service, LEGISLATORS_RANGE)
-    parsed = []
+    parsed: list[tuple[str, str, str]] = []
+
     for r in rows:
-        if len(r) < 2:
+        if not r:
             continue
-        name = (r[0] or "").strip()
-        website = (r[1] or "").strip()
+
+        name = (r[0] or "").strip() if len(r) >= 1 else ""
+        website = (r[1] or "").strip() if len(r) >= 2 else ""
         hub = (r[5] or "").strip() if len(r) >= 6 else ""
-        if name:
-            parsed.append((name, website, hub))
+
+        if not name:
+            continue
+
+        parsed.append((name, website, hub))
+
     return parsed
 
 
@@ -148,28 +153,30 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
         )
         browser.close()
 
-    full_links = []
+    # Normalize + keep same-domain only
+    full_links: list[str] = []
     for href in hrefs:
         full = normalize_url(search_url, href)
         if same_domain(search_url, full):
             full_links.append(full)
 
-    # de-dupe preserving order
-    seen = set()
-    uniq = []
+    # Keep only GetObject links with objectName
+    bill_links: list[str] = []
     for u in full_links:
+        ul = u.lower()
+        if "/home/getobject" in ul and "objectname=" in ul:
+            bill_links.append(canonicalize_legislature_url(u))
+
+    # De-dupe preserving order
+    seen = set()
+    uniq: list[str] = []
+    for u in bill_links:
         if u in seen:
             continue
         seen.add(u)
         uniq.append(u)
 
-    bill_links = []
-    for u in uniq:
-        ul = u.lower()
-        if "/home/getobject" in ul and "objectname=" in ul:
-            bill_links.append(canonicalize_legislature_url(u))
-
-    return bill_links[:MAX_LINKS_FROM_HUB]
+    return uniq[:MAX_LINKS_FROM_HUB]
 
 
 # =========================
@@ -189,34 +196,38 @@ def main():
     for name, home, hub_override in legislators:
         print(f"\n=== {name} ===")
 
-        if not hub_override:
-            print("No hub_url provided. Skipping (bill-only mode).")
+        hub = (hub_override or "").strip()
+        if not hub:
+            print("No hub_url provided in Legislators!F. Skipping (bill-only mode).")
             continue
 
-        hub = hub_override.strip()
-        print(f"Using hub_url from sheet: {hub}")
-
-        if "legislature.mi.gov/search/executesearch" not in hub.lower():
-            print("Hub is not a legislature Search/ExecuteSearch URL. Skipping (bill-only mode).")
+        hub_l = hub.lower()
+        if "legislature.mi.gov/search/executesearch" not in hub_l:
+            print(f"Hub is not a legislature ExecuteSearch URL. Skipping: {hub}")
             continue
+
+        print(f"Using legislature ExecuteSearch hub_url: {hub}")
 
         try:
             bill_links = collect_legislature_search_result_links(hub)
-            print(f"Collected {len(bill_links)} bill link(s).")
+            print(f"Collected {len(bill_links)} bill link(s) from search results.")
         except Exception as e:
             print(f"Failed to collect legislature search results: {e}")
             continue
 
         added = 0
         for u in bill_links:
+            # Safety: enforce bills only, even if something weird slips in
+            ul = u.lower()
+            if "/home/getobject" not in ul or "objectname=" not in ul:
+                continue
+
             if u in seen_urls:
                 continue
 
-            # SeenURLs
             new_seen_rows.append([u, name, now])
             seen_urls.add(u)
 
-            # Activity_Items (title/summary/tags filled later by analyze script)
             new_activity_rows.append([u, name, "bill", now, "", "", ""])
             added += 1
 
