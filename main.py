@@ -16,6 +16,7 @@ from googleapiclient.discovery import build
 SHEET_ID = os.environ["SHEET_ID"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# How many bill links to collect per legislator per run
 MAX_LINKS_FROM_HUB = 25
 
 # Legislators columns expected:
@@ -134,43 +135,71 @@ def read_seenurls(service) -> set[str]:
 
 
 # =========================
-# Legislature Search collector (Playwright)
+# Legislature Search collector (Playwright + regex)
 # =========================
 def collect_legislature_search_result_links(search_url: str) -> list[str]:
     """
     Extract bill/resolution detail links from legislature Search/ExecuteSearch pages.
-    Returns canonical GetObject URLs with queryID stripped.
+
+    Why this approach:
+    - The Legislature site sometimes renders results in ways that don't expose all documents
+      as plain <a href="..."> anchors in the DOM.
+    - We therefore scroll to ensure lazy content loads, grab full HTML, then regex out
+      all objectName=... occurrences and build canonical GetObject URLs.
+
+    Returns:
+      De-duped, canonical GetObject URLs (queryID stripped), capped to MAX_LINKS_FROM_HUB.
     """
+
+    # Force printerFriendly=true (more stable for scraping)
+    if "printerfriendly=" not in search_url.lower():
+        joiner = "&" if ("?" in search_url) else "?"
+        search_url = f"{search_url}{joiner}printerFriendly=true"
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
-        page.wait_for_timeout(2500)
-
-        hrefs = page.eval_on_selector_all(
-            "a[href]",
-            "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
         )
+
+        page.goto(search_url, wait_until="networkidle", timeout=120000)
+
+        # Scroll to bottom to trigger any lazy rendering
+        prev_height = 0
+        stable_rounds = 0
+        for _ in range(40):  # safety cap
+            height = page.evaluate("() => document.body.scrollHeight")
+            if height == prev_height:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+
+            if stable_rounds >= 2:
+                break
+
+            prev_height = height
+            page.evaluate("h => window.scrollTo(0, h)", height)
+            page.wait_for_timeout(500)
+
+        html = page.content()
         browser.close()
 
-    # Normalize + keep same-domain only
-    full_links: list[str] = []
-    for href in hrefs:
-        full = normalize_url(search_url, href)
-        if same_domain(search_url, full):
-            full_links.append(full)
+    # Regex extract all objectName values (works even if not <a href>)
+    obj_names = re.findall(r"objectName=([A-Za-z0-9\-]+)", html, flags=re.IGNORECASE)
 
-    # Keep only GetObject links with objectName
-    bill_links: list[str] = []
-    for u in full_links:
-        ul = u.lower()
-        if "/home/getobject" in ul and "objectname=" in ul:
-            bill_links.append(canonicalize_legislature_url(u))
+    links: list[str] = []
+    for obj in obj_names:
+        u = f"https://www.legislature.mi.gov/Home/GetObject?objectName={obj}"
+        links.append(canonicalize_legislature_url(u))
 
     # De-dupe preserving order
     seen = set()
     uniq: list[str] = []
-    for u in bill_links:
+    for u in links:
         if u in seen:
             continue
         seen.add(u)
@@ -193,7 +222,7 @@ def main():
     new_seen_rows: list[list[str]] = []
     new_activity_rows: list[list[str]] = []
 
-    for name, home, hub_override in legislators:
+    for name, _home, hub_override in legislators:
         print(f"\n=== {name} ===")
 
         hub = (hub_override or "").strip()
@@ -201,8 +230,7 @@ def main():
             print("No hub_url provided in Legislators!F. Skipping (bill-only mode).")
             continue
 
-        hub_l = hub.lower()
-        if "legislature.mi.gov/search/executesearch" not in hub_l:
+        if "legislature.mi.gov/search/executesearch" not in hub.lower():
             print(f"Hub is not a legislature ExecuteSearch URL. Skipping: {hub}")
             continue
 
@@ -210,14 +238,14 @@ def main():
 
         try:
             bill_links = collect_legislature_search_result_links(hub)
-            print(f"Collected {len(bill_links)} bill link(s) from search results.")
+            print(f"Collected {len(bill_links)} bill link(s) from search results (capped at {MAX_LINKS_FROM_HUB}).")
         except Exception as e:
             print(f"Failed to collect legislature search results: {e}")
             continue
 
         added = 0
         for u in bill_links:
-            # Safety: enforce bills only, even if something weird slips in
+            # Safety: enforce bills only
             ul = u.lower()
             if "/home/getobject" not in ul or "objectname=" not in ul:
                 continue
