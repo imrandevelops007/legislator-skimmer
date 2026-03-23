@@ -1,7 +1,7 @@
 import os
 import json
 import time
-from datetime import datetime
+import re
 from typing import List, Tuple
 
 import requests
@@ -23,37 +23,29 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 #   DRY_RUN=false -> calls Gemini
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-# Gemini model (keep as env override so you can change without code edits)
+# Gemini model
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-# How many blank rows to process per run
+# How many unprocessed rows to handle per run
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
-# Page text size cap sent to Gemini (reduces token cost)
+# Page text size cap sent to Gemini
 MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "12000"))
 
-# Optional: if Gemini rate limits, wait and retry
+# Optional retry count
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
 
-POLICY_TAGS = [
-    "Infrastructure",
-    "Small Business",
-    "Workforce",
-    "Tax",
-    "Education",
-    "Healthcare",
-    "Housing",
-    "Energy",
-    "Environment",
-    "Agriculture",
-    "Public Safety",
-    "Government Operations",
-    "Trade",
-    "Technology",
-    "Budget",
-]
-
-ACTIVITY_RANGE = "Activity_Items!A2:G"
+# Activity_Items columns:
+# A: URL
+# B: Legislator
+# C: Type
+# D: Timestamp
+# E: Bill Number
+# F: Bill Title
+# G: Bill Summary
+# H: Processed
+# I: Notes
+ACTIVITY_RANGE = "Activity_Items!A2:I"
 
 
 # =========================
@@ -77,9 +69,9 @@ def sheets_get_values(service, rng: str):
 
 def sheets_update_row(service, row_number: int, values: List[str]):
     """
-    Updates columns E-G for a given sheet row number.
+    Updates columns E-I for a given sheet row number.
     """
-    range_name = f"Activity_Items!E{row_number}:G{row_number}"
+    range_name = f"Activity_Items!E{row_number}:I{row_number}"
     body = {"values": [values]}
 
     service.spreadsheets().values().update(
@@ -88,6 +80,27 @@ def sheets_update_row(service, row_number: int, values: List[str]):
         valueInputOption="RAW",
         body=body,
     ).execute()
+
+
+# =========================
+# Helpers
+# =========================
+def pad_row(row: List[str], target_len: int = 9) -> List[str]:
+    return row + [""] * (target_len - len(row))
+
+
+def extract_bill_number_from_url(url: str) -> str:
+    """
+    Example:
+    https://www.legislature.mi.gov/Home/GetObject?objectName=2025-HB-4102
+    -> HB 4102
+    """
+    match = re.search(r"objectName=\d{4}-([A-Z]{1,3})-(\d+)", url, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    chamber = match.group(1).upper()
+    number = match.group(2)
+    return f"{chamber} {number}"
 
 
 # =========================
@@ -107,35 +120,33 @@ def fetch_readable_text(url: str, max_chars: int = MAX_PAGE_CHARS) -> str:
     lines = [ln.strip() for ln in text.splitlines()]
     text = "\n".join([ln for ln in lines if ln])
 
-    # Hard cap to reduce tokens/cost
     return text[:max_chars]
 
 
 # =========================
 # Gemini
 # =========================
-def _build_prompt(page_text: str, url: str, legislator_name: str) -> str:
-    allowed = ", ".join(POLICY_TAGS)
+def _build_prompt(page_text: str, url: str, legislator_name: str, bill_number: str) -> str:
     return f"""
 Return JSON only. No extra text.
 
-Allowed issue_tags (choose 1–3 from this list only):
-[{allowed}]
-
 Return:
 {{
-  "title": "...",
-  "summary": "...",
-  "issue_tags": ["Tag1", "Tag2"]
+  "bill_title": "...",
+  "bill_summary": "..."
 }}
 
 Rules:
-- Title should include bill number if present (example: "HB 4102 – ...").
-- Summary must be 2–3 plain English sentences.
-- issue_tags must be 1–3 items from the allowed list only.
+- bill_title should be the official or closest clear bill title from the page.
+- If useful, include the bill number at the beginning.
+- bill_summary must be 2-4 plain English sentences.
+- Keep bill_summary factual and readable.
+- Do not invent details that are not supported by the page text.
+- If the page text is limited, do your best with what is available.
 
 URL: {url}
 Legislator: {legislator_name}
+Bill Number from URL: {bill_number}
 
 PAGE TEXT:
 {page_text}
@@ -148,19 +159,12 @@ def _safe_extract_json(raw: str) -> dict:
     end = raw.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("Gemini did not return valid JSON.")
-    return json.loads(raw[start : end + 1])
+    return json.loads(raw[start:end + 1])
 
 
-def _normalize_tags(tags) -> str:
-    if not isinstance(tags, list):
-        tags = []
-    clean = [t for t in tags if isinstance(t, str) and t in POLICY_TAGS][:3]
-    return ", ".join(clean)
-
-
-def gemini_analyze(page_text: str, url: str, legislator_name: str) -> Tuple[str, str, str]:
+def gemini_analyze(page_text: str, url: str, legislator_name: str, bill_number: str) -> Tuple[str, str]:
     """
-    Returns (title, summary, issue_tags_csv).
+    Returns (bill_title, bill_summary).
     Handles retries for transient errors and prints clear logs.
     """
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -168,7 +172,7 @@ def gemini_analyze(page_text: str, url: str, legislator_name: str) -> Tuple[str,
         raise RuntimeError("GEMINI_API_KEY is missing. Set it in GitHub Secrets or your local env.")
 
     client = genai.Client(api_key=api_key)
-    prompt = _build_prompt(page_text, url, legislator_name)
+    prompt = _build_prompt(page_text, url, legislator_name, bill_number)
 
     last_err = None
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
@@ -179,31 +183,30 @@ def gemini_analyze(page_text: str, url: str, legislator_name: str) -> Tuple[str,
             )
             data = _safe_extract_json(getattr(resp, "text", ""))
 
-            title = str(data.get("title", "")).strip()
-            summary = str(data.get("summary", "")).strip()
-            tags_csv = _normalize_tags(data.get("issue_tags", []))
+            bill_title = str(data.get("bill_title", "")).strip()
+            bill_summary = str(data.get("bill_summary", "")).strip()
 
-            if not title or not summary:
-                raise ValueError("Gemini JSON missing title/summary.")
+            if not bill_title or not bill_summary:
+                raise ValueError("Gemini JSON missing bill_title or bill_summary.")
 
-            return title, summary, tags_csv
+            return bill_title, bill_summary
 
         except Exception as e:
             last_err = e
             msg = str(e)
-            # If rate limited, back off a bit
+
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 wait_s = min(30, 2 * attempt)
                 print(f"Gemini rate limited. Waiting {wait_s}s then retrying (attempt {attempt}/{GEMINI_MAX_RETRIES})...")
                 time.sleep(wait_s)
                 continue
-            # Transient service issues
+
             if "503" in msg or "UNAVAILABLE" in msg:
                 wait_s = min(30, 2 * attempt)
                 print(f"Gemini unavailable. Waiting {wait_s}s then retrying (attempt {attempt}/{GEMINI_MAX_RETRIES})...")
                 time.sleep(wait_s)
                 continue
-            # Otherwise fail fast
+
             raise
 
     raise RuntimeError(f"Gemini failed after {GEMINI_MAX_RETRIES} retries: {last_err}")
@@ -222,45 +225,91 @@ def main():
     rows = sheets_get_values(service, ACTIVITY_RANGE)
 
     print(f"Loaded {len(rows)} activity rows.")
-    processed = 0
 
-    for idx, row in enumerate(rows):
-        if processed >= BATCH_SIZE:
+    processed_count = 0
+    skipped_count = 0
+    error_count = 0
+
+    for idx, raw_row in enumerate(rows):
+        if processed_count >= BATCH_SIZE:
             break
 
-        # Sheet row number (A2 is row 2)
+        # A2 is sheet row 2
         sheet_row_number = idx + 2
+        row = pad_row(raw_row, 9)
 
-        url = row[0] if len(row) > 0 else ""
-        legislator_name = row[1] if len(row) > 1 else ""
-        existing_title = row[4] if len(row) > 4 else ""
+        url = row[0].strip()
+        legislator_name = row[1].strip()
+        processed_flag = row[7].strip().upper()
 
-        # Only process blank title rows
-        if not url or str(existing_title).strip():
+        if not url:
+            skipped_count += 1
+            continue
+
+        if processed_flag == "TRUE":
+            skipped_count += 1
             continue
 
         print(f"\nAnalyzing row {sheet_row_number}: {url}")
 
         try:
+            bill_number = extract_bill_number_from_url(url)
             page_text = fetch_readable_text(url, max_chars=MAX_PAGE_CHARS)
 
             if DRY_RUN:
-                # Placeholders so you can verify sheet updates and flow without spending tokens
-                new_title = "DRY RUN (Gemini disabled)"
-                new_summary = "DRY RUN: This is a placeholder summary while Gemini is disabled."
-                new_tags = "DRY RUN"
+                new_title = f"{bill_number} - DRY RUN TITLE" if bill_number else "DRY RUN TITLE"
+                new_summary = "DRY RUN: Placeholder summary to verify sheet updates and pipeline flow."
+                notes = "DRY RUN"
                 print("DRY RUN: Skipping Gemini call.")
             else:
-                new_title, new_summary, new_tags = gemini_analyze(page_text, url, legislator_name)
+                new_title, new_summary = gemini_analyze(
+                    page_text=page_text,
+                    url=url,
+                    legislator_name=legislator_name,
+                    bill_number=bill_number,
+                )
+                notes = ""
 
-            sheets_update_row(service, sheet_row_number, [new_title, new_summary, new_tags])
+            sheets_update_row(
+                service,
+                sheet_row_number,
+                [
+                    bill_number,     # E Bill Number
+                    new_title,       # F Bill Title
+                    new_summary,     # G Bill Summary
+                    "TRUE",          # H Processed
+                    notes,           # I Notes
+                ],
+            )
+
             print("Updated successfully.")
-            processed += 1
+            processed_count += 1
 
         except Exception as e:
-            print(f"Failed: {e}")
+            err_msg = str(e)[:400]
+            print(f"Failed: {err_msg}")
 
-    print(f"\nProcessed {processed} rows.")
+            try:
+                sheets_update_row(
+                    service,
+                    sheet_row_number,
+                    [
+                        row[4] if len(row) > 4 else "",   # existing Bill Number
+                        row[5] if len(row) > 5 else "",   # existing Bill Title
+                        row[6] if len(row) > 6 else "",   # existing Bill Summary
+                        "FALSE",                          # Processed
+                        f"Error: {err_msg}",              # Notes
+                    ],
+                )
+            except Exception as update_err:
+                print(f"Also failed to write error note back to sheet: {update_err}")
+
+            error_count += 1
+
+    print(
+        f"\nDone. Processed={processed_count}, "
+        f"Skipped={skipped_count}, Errors={error_count}"
+    )
 
 
 if __name__ == "__main__":
