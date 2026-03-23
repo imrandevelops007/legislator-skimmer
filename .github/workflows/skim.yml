@@ -38,8 +38,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DRY_RUN: "false"
           GEMINI_MODEL: "gemini-2.5-flash"
-          BATCH_SIZE: "3"
-          MAX_ITEMS_PER_RUN: "5"
+          BATCH_SIZE: "25"
+          MAX_ITEMS_PER_RUN: "25"
           MAX_PAGE_CHARS: "12000"
           GEMINI_MAX_RETRIES: "5"
           REQUEST_DELAY_SECONDS: "5"
