@@ -26,20 +26,22 @@ MAX_LINKS_FROM_HUB = 25
 LEGISLATORS_RANGE = "Legislators!A2:F"
 
 # SeenURLs columns:
-# A url
-# B legislator_name
-# C captured_at
+# A: url
+# B: legislator_name
+# C: captured_at
 SEENURLS_RANGE_APPEND = "SeenURLs!A:C"
 
 # Activity_Items columns:
-# A url
-# B legislator_name
-# C source_type (always "bill" in bill-only mode)
-# D captured_at
-# E title (blank for now)
-# F summary (blank for now)
-# G issue_tags (blank for now)
-ACTIVITY_RANGE_APPEND = "Activity_Items!A:G"
+# A: url
+# B: legislator_name
+# C: source_type (always "bill" in bill-only mode)
+# D: captured_at
+# E: bill_number
+# F: bill_title
+# G: bill_summary
+# H: processed
+# I: notes
+ACTIVITY_RANGE_APPEND = "Activity_Items!A:I"
 
 
 # =========================
@@ -90,8 +92,10 @@ def canonicalize_legislature_url(u: str) -> str:
     """
     Remove tracking params like queryID from GetObject URLs.
     Keeps only objectName.
+
     Example:
-      ...GetObject?objectName=2025-HB-4102&queryID=123 -> ...GetObject?objectName=2025-HB-4102
+      ...GetObject?objectName=2025-HB-4102&queryID=123
+      -> ...GetObject?objectName=2025-HB-4102
     """
     parsed = urlparse(u)
     m = re.search(r"(objectname=[^&]+)", parsed.query, flags=re.IGNORECASE)
@@ -114,36 +118,50 @@ def ensure_printer_friendly(url: str) -> str:
 def read_legislators(service):
     """
     Reads Legislators!A2:F
-    A=name, B=website_url, F=hub_url override (required in bill-only mode)
-    Returns list of tuples: (name, website_url, hub_url_or_blank)
+    A = name
+    B = website_url
+    F = hub_url override (required in bill-only mode)
+
+    Returns:
+        list[tuple[str, str, str]]
+        (name, website_url, hub_url_or_blank)
     """
     rows = sheets_get_values(service, LEGISLATORS_RANGE)
     parsed: list[tuple[str, str, str]] = []
+
     for r in rows:
         if not r:
             continue
+
         name = (r[0] or "").strip() if len(r) >= 1 else ""
         website = (r[1] or "").strip() if len(r) >= 2 else ""
         hub = (r[5] or "").strip() if len(r) >= 6 else ""
+
         if name:
             parsed.append((name, website, hub))
+
     return parsed
 
 
 def read_seen_pairs(service) -> set[tuple[str, str]]:
     """
     Reads SeenURLs!A2:B and returns a set of (url, legislator_name).
+
     This makes "seen" tracking per-legislator instead of global-by-URL.
     """
     rows = sheets_get_values(service, "SeenURLs!A2:B")
     out: set[tuple[str, str]] = set()
+
     for r in rows:
         if not r or len(r) < 2:
             continue
+
         url = (r[0] or "").strip()
         name = (r[1] or "").strip()
+
         if url and name:
             out.add((url, name))
+
     return out
 
 
@@ -176,8 +194,13 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
 
         html = page.content()
 
-        # Stage A: regex objectName extraction (works even if links aren't normal anchors)
-        obj_names = re.findall(r"objectName=([A-Za-z0-9\-]+)", html, flags=re.IGNORECASE)
+        # Stage A: regex objectName extraction
+        # Works even if links are not standard anchors
+        obj_names = re.findall(
+            r"objectName=([A-Za-z0-9\-]+)",
+            html,
+            flags=re.IGNORECASE
+        )
 
         links: list[str] = []
         if obj_names:
@@ -195,13 +218,14 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
                 full = normalize_url(page.url, href)
                 if not same_domain(page.url, full):
                     continue
+
                 ul = full.lower()
                 if "/home/getobject" in ul and "objectname=" in ul:
                     links.append(canonicalize_legislature_url(full))
 
         browser.close()
 
-    # de-dupe preserving order
+    # De-dupe while preserving order
     seen = set()
     uniq: list[str] = []
     for u in links:
@@ -224,7 +248,10 @@ def main():
     seen_pairs = read_seen_pairs(service)
 
     now = datetime.now(timezone.utc).isoformat()
-    print(f"Found {len(legislators)} legislator(s). Already seen {len(seen_pairs)} (url,name) pair(s).")
+    print(
+        f"Found {len(legislators)} legislator(s). "
+        f"Already seen {len(seen_pairs)} (url,name) pair(s)."
+    )
 
     new_seen_rows: list[list[str]] = []
     new_activity_rows: list[list[str]] = []
@@ -246,15 +273,19 @@ def main():
 
         try:
             bill_links = collect_legislature_search_result_links(hub)
-            print(f"Collected {len(bill_links)} bill link(s) from search results (capped at {MAX_LINKS_FROM_HUB}).")
+            print(
+                f"Collected {len(bill_links)} bill link(s) from search results "
+                f"(capped at {MAX_LINKS_FROM_HUB})."
+            )
         except Exception as e:
             print(f"Failed to collect legislature search results: {e}")
             continue
 
         added = 0
         for u in bill_links:
-            # Safety: enforce legislature GetObject only
             ul = u.lower()
+
+            # Safety: enforce legislature GetObject only
             if "/home/getobject" not in ul or "objectname=" not in ul:
                 continue
 
@@ -267,7 +298,27 @@ def main():
             seen_pairs.add(key)
 
             # Activity_Items per legislator
-            new_activity_rows.append([u, name, "bill", now, "", "", ""])
+            # Columns:
+            # A url
+            # B legislator_name
+            # C source_type
+            # D captured_at
+            # E bill_number
+            # F bill_title
+            # G bill_summary
+            # H processed
+            # I notes
+            new_activity_rows.append([
+                u,          # URL
+                name,       # Legislator
+                "bill",     # Type
+                now,        # Timestamp
+                "",         # Bill Number
+                "",         # Bill Title
+                "",         # Bill Summary
+                "FALSE",    # Processed
+                "",         # Notes
+            ])
             added += 1
 
         print(f"Added {added} new bill(s).")
