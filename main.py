@@ -25,12 +25,6 @@ MAX_LINKS_FROM_HUB = 25
 # F: hub_url override (MUST be a legislature Search/ExecuteSearch URL)
 LEGISLATORS_RANGE = "Legislators!A2:F"
 
-# SeenURLs columns:
-# A: url
-# B: legislator_name
-# C: captured_at
-SEENURLS_RANGE_APPEND = "SeenURLs!A:C"
-
 # Activity_Items columns:
 # A: url
 # B: legislator_name
@@ -42,6 +36,7 @@ SEENURLS_RANGE_APPEND = "SeenURLs!A:C"
 # H: processed
 # I: notes
 ACTIVITY_RANGE_APPEND = "Activity_Items!A:I"
+ACTIVITY_DEDUPE_RANGE = "Activity_Items!A2:B"
 
 
 # =========================
@@ -143,13 +138,15 @@ def read_legislators(service):
     return parsed
 
 
-def read_seen_pairs(service) -> set[tuple[str, str]]:
+def read_existing_activity_pairs(service) -> set[tuple[str, str]]:
     """
-    Reads SeenURLs!A2:B and returns a set of (url, legislator_name).
+    Reads Activity_Items!A2:B and returns a set of (url, legislator_name).
 
-    This makes "seen" tracking per-legislator instead of global-by-URL.
+    This lets Activity_Items act as both:
+    - the intake database
+    - the duplicate checker
     """
-    rows = sheets_get_values(service, "SeenURLs!A2:B")
+    rows = sheets_get_values(service, ACTIVITY_DEDUPE_RANGE)
     out: set[tuple[str, str]] = set()
 
     for r in rows:
@@ -244,16 +241,14 @@ def main():
     service = get_sheets_service()
     legislators = read_legislators(service)
 
-    # Per-legislator seen tracking
-    seen_pairs = read_seen_pairs(service)
+    existing_pairs = read_existing_activity_pairs(service)
 
     now = datetime.now(timezone.utc).isoformat()
     print(
         f"Found {len(legislators)} legislator(s). "
-        f"Already seen {len(seen_pairs)} (url,name) pair(s)."
+        f"Already logged {len(existing_pairs)} (url,name) pair(s) in Activity_Items."
     )
 
-    new_seen_rows: list[list[str]] = []
     new_activity_rows: list[list[str]] = []
 
     for name, _home, hub_override in legislators:
@@ -290,24 +285,11 @@ def main():
                 continue
 
             key = (u, name)
-            if key in seen_pairs:
+            if key in existing_pairs:
                 continue
 
-            # SeenURLs per legislator
-            new_seen_rows.append([u, name, now])
-            seen_pairs.add(key)
+            existing_pairs.add(key)
 
-            # Activity_Items per legislator
-            # Columns:
-            # A url
-            # B legislator_name
-            # C source_type
-            # D captured_at
-            # E bill_number
-            # F bill_title
-            # G bill_summary
-            # H processed
-            # I notes
             new_activity_rows.append([
                 u,          # URL
                 name,       # Legislator
@@ -323,11 +305,9 @@ def main():
 
         print(f"Added {added} new bill(s).")
 
-    sheets_append_values(service, SEENURLS_RANGE_APPEND, new_seen_rows)
     sheets_append_values(service, ACTIVITY_RANGE_APPEND, new_activity_rows)
 
-    print(f"\nAppended {len(new_seen_rows)} new row(s) to SeenURLs.")
-    print(f"Appended {len(new_activity_rows)} new row(s) to Activity_Items.")
+    print(f"\nAppended {len(new_activity_rows)} new row(s) to Activity_Items.")
 
 
 if __name__ == "__main__":
