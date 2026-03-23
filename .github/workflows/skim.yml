@@ -37,7 +37,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DRY_RUN: "false"
-          GEMINI_MODEL: "gemini-2.0-flash"
+          GEMINI_MODEL: "gemini-2.5-flash"
           BATCH_SIZE: "10"
           MAX_PAGE_CHARS: "12000"
           GEMINI_MAX_RETRIES: "3"
