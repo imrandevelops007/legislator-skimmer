@@ -2,6 +2,7 @@ import os
 import json
 import time
 import re
+import random
 from typing import List, Tuple
 
 import requests
@@ -27,13 +28,25 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # How many unprocessed rows to handle per run
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "3"))
+
+# Optional hard cap separate from BATCH_SIZE
+MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", str(BATCH_SIZE)))
 
 # Page text size cap sent to Gemini
 MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "12000"))
 
-# Optional retry count
-GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+# Retry count
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
+
+# Delay after successful Gemini calls
+REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "5"))
+
+# If we hit quota exhaustion repeatedly, stop the run so we do not keep hammering the API
+STOP_ON_QUOTA_EXHAUSTION = os.getenv("STOP_ON_QUOTA_EXHAUSTION", "true").lower() == "true"
+
+# HTTP timeout for bill page fetches
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 
 # Activity_Items columns:
 # A: URL
@@ -46,6 +59,13 @@ GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
 # H: Processed
 # I: Notes
 ACTIVITY_RANGE = "Activity_Items!A2:I"
+
+
+# =========================
+# Custom exceptions
+# =========================
+class GeminiQuotaExceededError(Exception):
+    pass
 
 
 # =========================
@@ -113,23 +133,46 @@ def clean_title_remove_bill_number(title: str, bill_number: str) -> str:
         cleaned = cleaned.replace(bill_number, "")
 
     # Remove leading patterns like "HB 4102 - ", "SB 12: ", "SR 5 – "
-    cleaned = re.sub(r'^[A-Z]{1,3}\s*\d+\s*[-:–]\s*', '', cleaned)
+    cleaned = re.sub(r"^[A-Z]{1,3}\s*\d+\s*[-:–]\s*", "", cleaned)
 
     # Remove standalone leading bill numbers like "HB 4102 "
-    cleaned = re.sub(r'^[A-Z]{1,3}\s*\d+\s*', '', cleaned)
+    cleaned = re.sub(r"^[A-Z]{1,3}\s*\d+\s*", "", cleaned)
 
     # Remove parenthetical bill number mentions like "(HB 4102)"
-    cleaned = re.sub(r'\(\s*[A-Z]{1,3}\s*\d+\s*\)', '', cleaned)
+    cleaned = re.sub(r"\(\s*[A-Z]{1,3}\s*\d+\s*\)", "", cleaned)
 
     return cleaned.strip(" -:–")
+
+
+def backoff_sleep(attempt: int):
+    """
+    Exponential backoff with jitter.
+    attempt 1 -> about 5s
+    attempt 2 -> about 10s
+    attempt 3 -> about 20s
+    attempt 4 -> about 40s
+    attempt 5+ -> capped around 60s
+    """
+    base = min(60, 5 * (2 ** (attempt - 1)))
+    jitter = random.uniform(0, 1.5)
+    wait_s = base + jitter
+    print(f"Waiting {wait_s:.1f}s before retry...")
+    time.sleep(wait_s)
+
+
+def build_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing. Set it in GitHub Secrets or your local env.")
+    return genai.Client(api_key=api_key)
 
 
 # =========================
 # Page Fetching
 # =========================
-def fetch_readable_text(url: str, max_chars: int = MAX_PAGE_CHARS) -> str:
+def fetch_readable_text(session: requests.Session, url: str, max_chars: int = MAX_PAGE_CHARS) -> str:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; SBDC-Analyzer/1.0)"}
-    r = requests.get(url, headers=headers, timeout=30)
+    r = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -177,26 +220,35 @@ PAGE TEXT:
 
 def _safe_extract_json(raw: str) -> dict:
     raw = (raw or "").strip()
+
+    # Remove fenced code block if Gemini returns one
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("Gemini did not return valid JSON.")
+
     return json.loads(raw[start:end + 1])
 
 
-def gemini_analyze(page_text: str, url: str, legislator_name: str, bill_number: str) -> Tuple[str, str]:
+def gemini_analyze(
+    client: genai.Client,
+    page_text: str,
+    url: str,
+    legislator_name: str,
+    bill_number: str,
+) -> Tuple[str, str]:
     """
     Returns (bill_title, bill_summary).
-    Handles retries for transient errors and prints clear logs.
+    Handles retries for transient errors and clearer quota behavior.
     """
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is missing. Set it in GitHub Secrets or your local env.")
-
-    client = genai.Client(api_key=api_key)
     prompt = _build_prompt(page_text, url, legislator_name, bill_number)
-
     last_err = None
+
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
             resp = client.models.generate_content(
@@ -217,17 +269,32 @@ def gemini_analyze(page_text: str, url: str, legislator_name: str, bill_number: 
             last_err = e
             msg = str(e)
 
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                wait_s = min(30, 2 * attempt)
-                print(f"Gemini rate limited. Waiting {wait_s}s then retrying (attempt {attempt}/{GEMINI_MAX_RETRIES})...")
-                time.sleep(wait_s)
-                continue
+            is_quota = ("429" in msg) or ("RESOURCE_EXHAUSTED" in msg)
+            is_unavailable = ("503" in msg) or ("UNAVAILABLE" in msg)
 
-            if "503" in msg or "UNAVAILABLE" in msg:
-                wait_s = min(30, 2 * attempt)
-                print(f"Gemini unavailable. Waiting {wait_s}s then retrying (attempt {attempt}/{GEMINI_MAX_RETRIES})...")
-                time.sleep(wait_s)
-                continue
+            if is_quota:
+                print(
+                    f"Gemini quota/rate limit hit "
+                    f"(attempt {attempt}/{GEMINI_MAX_RETRIES})."
+                )
+                if attempt < GEMINI_MAX_RETRIES:
+                    backoff_sleep(attempt)
+                    continue
+                raise GeminiQuotaExceededError(
+                    f"Gemini failed after {GEMINI_MAX_RETRIES} retries: {last_err}"
+                )
+
+            if is_unavailable:
+                print(
+                    f"Gemini temporarily unavailable "
+                    f"(attempt {attempt}/{GEMINI_MAX_RETRIES})."
+                )
+                if attempt < GEMINI_MAX_RETRIES:
+                    backoff_sleep(attempt)
+                    continue
+                raise RuntimeError(
+                    f"Gemini unavailable after {GEMINI_MAX_RETRIES} retries: {last_err}"
+                )
 
             raise
 
@@ -240,8 +307,12 @@ def gemini_analyze(page_text: str, url: str, legislator_name: str, bill_number: 
 def main():
     print(f"DRY_RUN mode: {DRY_RUN}")
     print(f"BATCH_SIZE: {BATCH_SIZE}")
+    print(f"MAX_ITEMS_PER_RUN: {MAX_ITEMS_PER_RUN}")
     print(f"GEMINI_MODEL: {GEMINI_MODEL}")
     print(f"MAX_PAGE_CHARS: {MAX_PAGE_CHARS}")
+    print(f"GEMINI_MAX_RETRIES: {GEMINI_MAX_RETRIES}")
+    print(f"REQUEST_DELAY_SECONDS: {REQUEST_DELAY_SECONDS}")
+    print(f"STOP_ON_QUOTA_EXHAUSTION: {STOP_ON_QUOTA_EXHAUSTION}")
 
     service = get_sheets_service()
     rows = sheets_get_values(service, ACTIVITY_RANGE)
@@ -251,96 +322,142 @@ def main():
     processed_count = 0
     skipped_count = 0
     error_count = 0
+    quota_stop_triggered = False
 
-    for idx, raw_row in enumerate(rows):
-        if processed_count >= BATCH_SIZE:
-            break
+    client = None if DRY_RUN else build_client()
+    session = requests.Session()
 
-        # A2 is sheet row 2
-        sheet_row_number = idx + 2
-        row = pad_row(raw_row, 9)
+    try:
+        for idx, raw_row in enumerate(rows):
+            if processed_count >= BATCH_SIZE or processed_count >= MAX_ITEMS_PER_RUN:
+                break
 
-        url = row[0].strip()
-        legislator_name = row[1].strip()
-        processed_flag_existing = row[7].strip().upper()
-        notes_existing = row[8].strip().upper()
+            # A2 is sheet row 2
+            sheet_row_number = idx + 2
+            row = pad_row(raw_row, 9)
 
-        if not url:
-            skipped_count += 1
-            continue
+            url = row[0].strip()
+            legislator_name = row[1].strip()
+            item_type = row[2].strip().lower()
+            processed_flag_existing = row[7].strip().upper()
+            notes_existing = row[8].strip().upper()
 
-        # Always skip truly processed rows
-        if processed_flag_existing == "TRUE":
-            skipped_count += 1
-            continue
+            if not url:
+                skipped_count += 1
+                continue
 
-        # During DRY_RUN, skip rows already marked as DRY RUN so they are not rewritten every time
-        if DRY_RUN and notes_existing == "DRY RUN":
-            skipped_count += 1
-            continue
+            if item_type and item_type != "bill":
+                skipped_count += 1
+                continue
 
-        print(f"\nAnalyzing row {sheet_row_number}: {url}")
+            # Always skip truly processed rows
+            if processed_flag_existing == "TRUE":
+                skipped_count += 1
+                continue
 
-        try:
-            bill_number = extract_bill_number_from_url(url)
-            page_text = fetch_readable_text(url, max_chars=MAX_PAGE_CHARS)
+            # During DRY_RUN, skip rows already marked as DRY RUN
+            if DRY_RUN and notes_existing == "DRY RUN":
+                skipped_count += 1
+                continue
 
-            if DRY_RUN:
-                new_title = "DRY RUN TITLE"
-                new_summary = "DRY RUN: Placeholder summary to verify sheet updates and pipeline flow."
-                notes = "DRY RUN"
-                processed_flag_to_write = "FALSE"
-                print("DRY RUN: Skipping Gemini call.")
-            else:
-                new_title, new_summary = gemini_analyze(
-                    page_text=page_text,
-                    url=url,
-                    legislator_name=legislator_name,
-                    bill_number=bill_number,
-                )
-                new_title = clean_title_remove_bill_number(new_title, bill_number)
-                notes = ""
-                processed_flag_to_write = "TRUE"
-
-            sheets_update_row(
-                service,
-                sheet_row_number,
-                [
-                    bill_number,              # E Bill Number
-                    new_title,                # F Bill Title
-                    new_summary,              # G Bill Summary
-                    processed_flag_to_write,  # H Processed
-                    notes,                    # I Notes
-                ],
-            )
-
-            print("Updated successfully.")
-            processed_count += 1
-
-        except Exception as e:
-            err_msg = str(e)[:400]
-            print(f"Failed: {err_msg}")
+            print(f"\nAnalyzing row {sheet_row_number}: {url}")
 
             try:
+                bill_number = extract_bill_number_from_url(url)
+                page_text = fetch_readable_text(session, url, max_chars=MAX_PAGE_CHARS)
+
+                if DRY_RUN:
+                    new_title = "DRY RUN TITLE"
+                    new_summary = "DRY RUN: Placeholder summary to verify sheet updates and pipeline flow."
+                    notes = "DRY RUN"
+                    processed_flag_to_write = "FALSE"
+                    print("DRY RUN: Skipping Gemini call.")
+                else:
+                    new_title, new_summary = gemini_analyze(
+                        client=client,
+                        page_text=page_text,
+                        url=url,
+                        legislator_name=legislator_name,
+                        bill_number=bill_number,
+                    )
+                    new_title = clean_title_remove_bill_number(new_title, bill_number)
+                    notes = ""
+                    processed_flag_to_write = "TRUE"
+
                 sheets_update_row(
                     service,
                     sheet_row_number,
                     [
-                        row[4] if len(row) > 4 else "",   # existing Bill Number
-                        row[5] if len(row) > 5 else "",   # existing Bill Title
-                        row[6] if len(row) > 6 else "",   # existing Bill Summary
-                        "FALSE",                          # Processed
-                        f"Error: {err_msg}",              # Notes
+                        bill_number,              # E Bill Number
+                        new_title,                # F Bill Title
+                        new_summary,              # G Bill Summary
+                        processed_flag_to_write,  # H Processed
+                        notes,                    # I Notes
                     ],
                 )
-            except Exception as update_err:
-                print(f"Also failed to write error note back to sheet: {update_err}")
 
-            error_count += 1
+                print("Updated successfully.")
+                processed_count += 1
+
+                # Small pause between successful Gemini calls to reduce burst pressure
+                if not DRY_RUN and REQUEST_DELAY_SECONDS > 0:
+                    print(f"Sleeping {REQUEST_DELAY_SECONDS:.1f}s before next item...")
+                    time.sleep(REQUEST_DELAY_SECONDS)
+
+            except GeminiQuotaExceededError as e:
+                err_msg = str(e)[:400]
+                print(f"Quota stop: {err_msg}")
+
+                try:
+                    sheets_update_row(
+                        service,
+                        sheet_row_number,
+                        [
+                            row[4] if len(row) > 4 else "",   # existing Bill Number
+                            row[5] if len(row) > 5 else "",   # existing Bill Title
+                            row[6] if len(row) > 6 else "",   # existing Bill Summary
+                            "FALSE",                          # Processed
+                            f"Error: {err_msg}",              # Notes
+                        ],
+                    )
+                except Exception as update_err:
+                    print(f"Also failed to write quota error note back to sheet: {update_err}")
+
+                error_count += 1
+                quota_stop_triggered = True
+
+                if STOP_ON_QUOTA_EXHAUSTION:
+                    print("Stopping run after quota exhaustion to avoid repeated failed calls.")
+                    break
+
+            except Exception as e:
+                err_msg = str(e)[:400]
+                print(f"Failed: {err_msg}")
+
+                try:
+                    sheets_update_row(
+                        service,
+                        sheet_row_number,
+                        [
+                            row[4] if len(row) > 4 else "",   # existing Bill Number
+                            row[5] if len(row) > 5 else "",   # existing Bill Title
+                            row[6] if len(row) > 6 else "",   # existing Bill Summary
+                            "FALSE",                          # Processed
+                            f"Error: {err_msg}",              # Notes
+                        ],
+                    )
+                except Exception as update_err:
+                    print(f"Also failed to write error note back to sheet: {update_err}")
+
+                error_count += 1
+
+    finally:
+        session.close()
 
     print(
         f"\nDone. Processed={processed_count}, "
-        f"Skipped={skipped_count}, Errors={error_count}"
+        f"Skipped={skipped_count}, Errors={error_count}, "
+        f"QuotaStopped={quota_stop_triggered}"
     )
 
 
