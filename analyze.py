@@ -19,8 +19,8 @@ SHEET_ID = os.environ["SHEET_ID"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Toggle AI calls without changing code:
-#   DRY_RUN=true  -> no Gemini calls (fills placeholders)
-#   DRY_RUN=false -> calls Gemini
+#   DRY_RUN=true  -> no Gemini calls (fills placeholders, keeps Processed=FALSE)
+#   DRY_RUN=false -> calls Gemini and marks Processed=TRUE
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 # Gemini model
@@ -103,6 +103,27 @@ def extract_bill_number_from_url(url: str) -> str:
     return f"{chamber} {number}"
 
 
+def clean_title_remove_bill_number(title: str, bill_number: str) -> str:
+    if not title:
+        return title
+
+    cleaned = title
+
+    if bill_number:
+        cleaned = cleaned.replace(bill_number, "")
+
+    # Remove leading patterns like "HB 4102 - ", "SB 12: ", "SR 5 – "
+    cleaned = re.sub(r'^[A-Z]{1,3}\s*\d+\s*[-:–]\s*', '', cleaned)
+
+    # Remove standalone leading bill numbers like "HB 4102 "
+    cleaned = re.sub(r'^[A-Z]{1,3}\s*\d+\s*', '', cleaned)
+
+    # Remove parenthetical bill number mentions like "(HB 4102)"
+    cleaned = re.sub(r'\(\s*[A-Z]{1,3}\s*\d+\s*\)', '', cleaned)
+
+    return cleaned.strip(" -:–")
+
+
 # =========================
 # Page Fetching
 # =========================
@@ -138,7 +159,8 @@ Return:
 
 Rules:
 - bill_title should be the official or closest clear bill title from the page.
-- If useful, include the bill number at the beginning.
+- DO NOT include the bill number in the title.
+- The title should be clean and readable on its own.
 - bill_summary must be 2-4 plain English sentences.
 - Keep bill_summary factual and readable.
 - Do not invent details that are not supported by the page text.
@@ -240,13 +262,20 @@ def main():
 
         url = row[0].strip()
         legislator_name = row[1].strip()
-        processed_flag = row[7].strip().upper()
+        processed_flag_existing = row[7].strip().upper()
+        notes_existing = row[8].strip().upper()
 
         if not url:
             skipped_count += 1
             continue
 
-        if processed_flag == "TRUE":
+        # Always skip truly processed rows
+        if processed_flag_existing == "TRUE":
+            skipped_count += 1
+            continue
+
+        # During DRY_RUN, skip rows already marked as DRY RUN so they are not rewritten every time
+        if DRY_RUN and notes_existing == "DRY RUN":
             skipped_count += 1
             continue
 
@@ -257,9 +286,10 @@ def main():
             page_text = fetch_readable_text(url, max_chars=MAX_PAGE_CHARS)
 
             if DRY_RUN:
-                new_title = f"{bill_number} - DRY RUN TITLE" if bill_number else "DRY RUN TITLE"
+                new_title = "DRY RUN TITLE"
                 new_summary = "DRY RUN: Placeholder summary to verify sheet updates and pipeline flow."
                 notes = "DRY RUN"
+                processed_flag_to_write = "FALSE"
                 print("DRY RUN: Skipping Gemini call.")
             else:
                 new_title, new_summary = gemini_analyze(
@@ -268,17 +298,19 @@ def main():
                     legislator_name=legislator_name,
                     bill_number=bill_number,
                 )
+                new_title = clean_title_remove_bill_number(new_title, bill_number)
                 notes = ""
+                processed_flag_to_write = "TRUE"
 
             sheets_update_row(
                 service,
                 sheet_row_number,
                 [
-                    bill_number,     # E Bill Number
-                    new_title,       # F Bill Title
-                    new_summary,     # G Bill Summary
-                    "TRUE",          # H Processed
-                    notes,           # I Notes
+                    bill_number,              # E Bill Number
+                    new_title,                # F Bill Title
+                    new_summary,              # G Bill Summary
+                    processed_flag_to_write,  # H Processed
+                    notes,                    # I Notes
                 ],
             )
 
