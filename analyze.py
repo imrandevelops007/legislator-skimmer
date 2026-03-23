@@ -24,7 +24,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 # Gemini model
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # How many unprocessed rows to handle per run
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
