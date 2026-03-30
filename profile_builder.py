@@ -2,8 +2,9 @@ import os
 import json
 import time
 import random
+import re
 from datetime import datetime, timezone
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -21,56 +22,35 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 MAX_BILLS_PER_LEGISLATOR = int(os.getenv("MAX_BILLS_PER_LEGISLATOR", "12"))
 PROFILE_MAX_RETRIES = int(os.getenv("PROFILE_MAX_RETRIES", "5"))
-REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "3"))
+PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "3"))
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
-# Sheet ranges
-# Legislator_Metadata columns:
-# A Legislator
-# B Chamber
-# C District
-# D Party
-# E First_Elected_to_Current_Chamber
-# F Current_Term_Start
-# G Current_Term_End
-# H Time_In_Office_Note
-# I Education
-# J Professional_Background
-# K Government_Experience
-# L Committee_Assignments
-# M Key_Issues_Source
-# N Political_Positioning_Source
-# O Verification_Notes
-METADATA_RANGE = "Legislator_Metadata!A2:O"
+# Require at least this many processed items before generating a profile
+MIN_BILLS_REQUIRED = int(os.getenv("MIN_BILLS_REQUIRED", "3"))
 
-# Activity_Items columns:
-# A URL
-# B Legislator
-# C Type
-# D Timestamp
-# E Bill Number
-# F Bill Title
-# G Bill Summary
-# H Processed
-# I Notes
+# Sheet ranges
+METADATA_RANGE = "Legislator_Metadata!A2:O"
 ACTIVITY_RANGE = "Activity_Items!A2:I"
+PROFILES_RANGE = "Profiles_Dynamic!A2:Q"
 
 # Profiles_Dynamic columns:
-# A Legislator
-# B Generated_Bio
-# C Top_Themes
-# D Key_Issues
-# E Political_Positioning
-# F Political_Position_Notes
-# G Key_Bills
-# H SBDC_Alignment
-# I Talking_Points
-# J Bills_Analyzed_Count
-# K Source_Bill_Numbers
-# L Last_Updated
-# M Profile_Processed
-# N Notes
-PROFILES_RANGE = "Profiles_Dynamic!A2:N"
+# A  Legislator
+# B  Committee_Relevance_Summary
+# C  Time_In_Office_Summary
+# D  Generated_Biography
+# E  Key_Issues
+# F  District_Development_Signals
+# G  Legislative_Focus_Areas
+# H  Key_Bills
+# I  Political_Positioning
+# J  Political_Positioning_Bullets
+# K  SBDC_Framing
+# L  Talking_Points
+# M  Bills_Analyzed_Count
+# N  Source_Bill_Numbers
+# O  Last_Updated
+# P  Profile_Processed
+# Q  Notes
 
 
 # =========================
@@ -190,12 +170,58 @@ def load_existing_profiles(service) -> Dict[str, int]:
     out: Dict[str, int] = {}
 
     for idx, row in enumerate(rows, start=2):
-        row = pad_row(row, 14)
+        row = pad_row(row, 17)
         legislator = row[0].strip()
         if legislator:
             out[legislator] = idx
 
     return out
+
+
+# =========================
+# Bill prioritization
+# =========================
+def classify_bill_priority(bill_number: str) -> int:
+    """
+    Lower number = higher priority.
+    Prioritize substantive policy bills first.
+    """
+    bill_number = (bill_number or "").upper().strip()
+
+    if re.match(r"^(HB|SB)\s+\d+$", bill_number):
+        return 1
+
+    if re.match(r"^(HCR|SCR)\s+\d+$", bill_number):
+        return 2
+
+    if re.match(r"^(HR|SR)\s+\d+$", bill_number):
+        return 3
+
+    return 4
+
+
+def select_best_bills(bills: List[Dict[str, str]], max_bills: int) -> List[Dict[str, str]]:
+    """
+    Prefer substantive bills, then secondary resolutions, then ceremonial items.
+    Keep newer items first within each bucket.
+    """
+    buckets: Dict[int, List[Dict[str, str]]] = {1: [], 2: [], 3: [], 4: []}
+
+    for bill in bills:
+        priority = classify_bill_priority(bill["bill_number"])
+        buckets[priority].append(bill)
+
+    selected: List[Dict[str, str]] = []
+
+    for priority in [1, 2, 3, 4]:
+        for bill in buckets[priority]:
+            if len(selected) >= max_bills:
+                break
+            selected.append(bill)
+        if len(selected) >= max_bills:
+            break
+
+    return selected
 
 
 # =========================
@@ -217,39 +243,120 @@ def backoff_sleep(attempt: int):
 
 def build_prompt(metadata: Dict[str, str], bills: List[Dict[str, str]]) -> str:
     instructions = """
-You are a nonpartisan policy analyst helping create a concise legislator outreach briefing for the Michigan SBDC.
+You are a nonpartisan policy analyst helping create a concise legislator briefing for the Michigan SBDC.
 
 Return ONLY valid JSON with exactly these keys:
-- generated_bio
-- top_themes
+- committee_relevance_summary
+- time_in_office_summary
+- generated_biography
 - key_issues
-- political_positioning
-- political_position_notes
+- district_development_signals
+- legislative_focus_areas
 - key_bills
-- sbdc_alignment
+- political_positioning
+- political_positioning_bullets
+- sbdc_framing
 - talking_points
 
-Rules:
-- Use only facts supported by the metadata and bill list.
+Core objective:
+Create a high-quality legislator profile that is useful for strategic outreach. The profile should reflect durable policy priorities, governing style, committee relevance, district-relevant development signals, and how Michigan SBDC should frame its work.
+
+General rules:
+- Use only the metadata and bill list provided.
+- Do not invent facts.
 - Be concise, specific, and professional.
-- generated_bio must be an array with 2 or 3 short bullet-ready statements.
-- top_themes must be an array with 3 to 5 items.
-- key_issues must be an array with 3 to 5 items.
-- political_positioning must be a short label, not a paragraph.
-- political_position_notes must be 1 or 2 sentences and cautious in tone.
-- key_bills must be an array with 3 to 5 items. Each item must have:
-  - bill_number
-  - summary
-- bill summaries must be one sentence each.
-- sbdc_alignment must be 2 or 3 sentences.
-- talking_points must be an array with 3 to 5 concise outreach bullets.
+- Use cautious language when evidence is limited.
+- Prefer durable signals over superficial recent activity.
 - Do not use markdown.
 - Output JSON only.
+
+Interpretation rules:
+- Prioritize substantive policy legislation over commemorative, ceremonial, or honorary resolutions.
+- If the bill list contains many commemorative resolutions, do not let them dominate the profile unless they are the only available legislative activity.
+- Use metadata, committee assignments, professional background, government experience, and substantive bills to infer durable priorities.
+- Treat ceremonial resolutions as weak signals compared with committee roles, professional background, and substantive legislation.
+- Do not reduce the legislator's profile to awareness-month or recognition resolutions if stronger policy signals exist.
+
+Field requirements:
+
+- committee_relevance_summary:
+  - short paragraph or 2 short bullet-ready statements
+  - explain why the legislator's committee assignments matter for business, economic development, workforce, budgeting, regulation, education, health, infrastructure, or related SBDC-relevant issues
+  - focus on practical policy relevance, not just list repetition
+
+- time_in_office_summary:
+  - array of 2 to 4 short bullet-ready statements
+  - summarize prior offices, chamber tenure, and current role
+  - use metadata directly
+
+- generated_biography:
+  - array of 2 to 4 short bullet-ready statements
+  - summarize education, business/professional background, relevant sector experience, and public service background
+  - should lean heavily on metadata, not bill activity
+
+- key_issues:
+  - array of 3 to 5 items
+  - each item should include a short issue label with a brief explanation
+  - reflect durable interests suggested by committees, background, and legislation
+  - examples: "Economic Development: Supports redevelopment and local growth"
+  - avoid ceremonial themes unless no stronger themes exist
+
+- district_development_signals:
+  - array of 2 to 4 concise bullet-ready statements
+  - identify district-relevant development, investment, funding, growth, or economic signals supported by the metadata and legislation
+  - these should be practical, not speculative
+  - if evidence is weak, keep the statements cautious
+
+- legislative_focus_areas:
+  - array of 3 to 5 items
+  - each item should include a short focus area label with a brief explanation
+  - reflect current legislative priorities or repeated patterns
+  - prioritize substantive policy areas over recognition resolutions
+
+- key_bills:
+  - array of 3 to 5 items
+  - each item must include:
+    - bill_number
+    - summary
+  - choose the most representative and substantive bills
+  - one-sentence summaries only
+  - do not prioritize ceremonial resolutions if substantive bills are available
+
+- political_positioning:
+  - short label only
+  - describe relative ideological or governing orientation
+  - examples: "Center-right | Pro-business | Fiscal conservative"
+  - examples: "Center-left | Institution-focused | Workforce-oriented"
+  - do not simply restate party unless there is no better supported characterization
+
+- political_positioning_bullets:
+  - array of 2 to 4 concise bullet-ready statements
+  - explain the positioning using committee roles, background, and legislative behavior
+  - avoid overclaiming ideology
+  - emphasize governing style, priorities, and practical orientation
+
+- sbdc_framing:
+  - 2 to 4 sentences
+  - explain how Michigan SBDC should frame its message to this legislator
+  - focus on overlap such as entrepreneurship, regional growth, ROI, workforce, access to capital, local business resilience, redevelopment, or economic infrastructure
+  - this should feel strategic and actionable
+
+- talking_points:
+  - array of 4 to 6 concise outreach bullets
+  - should be practical, specific, and usable in conversation or briefing materials
+  - connect Michigan SBDC to the legislator's likely interests
+  - avoid vague ceremonial talking points unless no stronger basis exists
+
+Quality bar:
+- The final profile should feel like a strategic briefing, not a literal recap of bill titles.
+- Favor durable policy signals over surface-level recent activity.
+- Use committee roles and professional background to strengthen interpretation.
+- If evidence is mixed, produce the most balanced, useful, and defensible profile possible.
 """.strip()
 
     payload = {
         "metadata": metadata,
-        "recent_bills": bills,
+        "selected_recent_bills": bills,
     }
 
     return f"{instructions}\n\nINPUT:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
@@ -296,26 +403,45 @@ def call_gemini(client: genai.Client, prompt: str) -> Dict[str, Any]:
 
 
 # =========================
-# Transform + write
+# Transform helpers
 # =========================
+def join_pipe(items: Any) -> str:
+    if not isinstance(items, list):
+        return ""
+    return " | ".join([str(x).strip() for x in items if str(x).strip()])
+
+
+def normalize_key_bills(items: Any) -> str:
+    if not isinstance(items, list):
+        return ""
+
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        bill_number = str(item.get("bill_number", "")).strip()
+        summary = str(item.get("summary", "")).strip()
+        if bill_number and summary:
+            out.append(f"{bill_number}::{summary}")
+    return " || ".join(out)
+
+
 def to_sheet_row(
     legislator: str,
     result: Dict[str, Any],
     bills: List[Dict[str, str]],
 ) -> List[str]:
-    generated_bio = " | ".join(result.get("generated_bio", []))
-    top_themes = " | ".join(result.get("top_themes", []))
-    key_issues = " | ".join(result.get("key_issues", []))
+    committee_relevance_summary = str(result.get("committee_relevance_summary", "")).strip()
+    time_in_office_summary = join_pipe(result.get("time_in_office_summary", []))
+    generated_biography = join_pipe(result.get("generated_biography", []))
+    key_issues = join_pipe(result.get("key_issues", []))
+    district_development_signals = join_pipe(result.get("district_development_signals", []))
+    legislative_focus_areas = join_pipe(result.get("legislative_focus_areas", []))
+    key_bills = normalize_key_bills(result.get("key_bills", []))
     political_positioning = str(result.get("political_positioning", "")).strip()
-    political_position_notes = str(result.get("political_position_notes", "")).strip()
-
-    key_bills = " || ".join(
-        f'{str(item.get("bill_number", "")).strip()}::{str(item.get("summary", "")).strip()}'
-        for item in result.get("key_bills", [])
-    )
-
-    sbdc_alignment = str(result.get("sbdc_alignment", "")).strip()
-    talking_points = " | ".join(result.get("talking_points", []))
+    political_positioning_bullets = join_pipe(result.get("political_positioning_bullets", []))
+    sbdc_framing = str(result.get("sbdc_framing", "")).strip()
+    talking_points = join_pipe(result.get("talking_points", []))
     bills_analyzed_count = str(len(bills))
     source_bill_numbers = " | ".join([b["bill_number"] for b in bills])
     last_updated = datetime.now(timezone.utc).isoformat()
@@ -323,39 +449,45 @@ def to_sheet_row(
     notes = ""
 
     return [
-        legislator,
-        generated_bio,
-        top_themes,
-        key_issues,
-        political_positioning,
-        political_position_notes,
-        key_bills,
-        sbdc_alignment,
-        talking_points,
-        bills_analyzed_count,
-        source_bill_numbers,
-        last_updated,
-        profile_processed,
-        notes,
+        legislator,                     # A
+        committee_relevance_summary,   # B
+        time_in_office_summary,        # C
+        generated_biography,           # D
+        key_issues,                    # E
+        district_development_signals,  # F
+        legislative_focus_areas,       # G
+        key_bills,                     # H
+        political_positioning,         # I
+        political_positioning_bullets, # J
+        sbdc_framing,                  # K
+        talking_points,                # L
+        bills_analyzed_count,          # M
+        source_bill_numbers,           # N
+        last_updated,                  # O
+        profile_processed,             # P
+        notes,                         # Q
     ]
 
 
 def to_error_row(legislator: str, bills: List[Dict[str, str]], error: str) -> List[str]:
     return [
-        legislator,
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        str(len(bills)),
-        " | ".join([b["bill_number"] for b in bills]),
-        datetime.now(timezone.utc).isoformat(),
-        "FALSE",
-        error[:500],
+        legislator,                                    # A
+        "",                                            # B
+        "",                                            # C
+        "",                                            # D
+        "",                                            # E
+        "",                                            # F
+        "",                                            # G
+        "",                                            # H
+        "",                                            # I
+        "",                                            # J
+        "",                                            # K
+        "",                                            # L
+        str(len(bills)),                               # M
+        " | ".join([b["bill_number"] for b in bills]), # N
+        datetime.now(timezone.utc).isoformat(),        # O
+        "FALSE",                                       # P
+        error[:500],                                   # Q
     ]
 
 
@@ -364,10 +496,10 @@ def write_profile(service, existing_profiles: Dict[str, int], row_values: List[s
 
     if legislator in existing_profiles:
         row_num = existing_profiles[legislator]
-        target_range = f"Profiles_Dynamic!A{row_num}:N{row_num}"
+        target_range = f"Profiles_Dynamic!A{row_num}:Q{row_num}"
         sheets_update_range(service, target_range, [row_values])
     else:
-        sheets_append_rows(service, "Profiles_Dynamic!A:N", [row_values])
+        sheets_append_rows(service, "Profiles_Dynamic!A:Q", [row_values])
 
 
 # =========================
@@ -377,7 +509,8 @@ def main():
     print(f"GEMINI_MODEL: {GEMINI_MODEL}")
     print(f"MAX_BILLS_PER_LEGISLATOR: {MAX_BILLS_PER_LEGISLATOR}")
     print(f"PROFILE_MAX_RETRIES: {PROFILE_MAX_RETRIES}")
-    print(f"PROFILE_REQUEST_DELAY_SECONDS: {REQUEST_DELAY_SECONDS}")
+    print(f"PROFILE_REQUEST_DELAY_SECONDS: {PROFILE_REQUEST_DELAY_SECONDS}")
+    print(f"MIN_BILLS_REQUIRED: {MIN_BILLS_REQUIRED}")
     if ONLY_LEGISLATOR:
         print(f"ONLY_LEGISLATOR: {ONLY_LEGISLATOR}")
 
@@ -397,27 +530,31 @@ def main():
 
     for legislator in legislators:
         metadata = metadata_by_legislator[legislator]
-        bills = activity_by_legislator[legislator][:MAX_BILLS_PER_LEGISLATOR]
+        all_bills = activity_by_legislator[legislator]
 
-        if len(bills) < 3:
-            print(f"Skipping {legislator}: not enough processed bills yet ({len(bills)}).")
+        if len(all_bills) < MIN_BILLS_REQUIRED:
+            print(f"Skipping {legislator}: not enough processed bills yet ({len(all_bills)}).")
             continue
 
-        print(f"Building profile for {legislator} using {len(bills)} bill(s)...")
+        selected_bills = select_best_bills(all_bills, MAX_BILLS_PER_LEGISLATOR)
+
+        print(f"Building profile for {legislator} using {len(selected_bills)} selected bill(s)...")
+        for bill in selected_bills:
+            print(f"  - {bill['bill_number']}")
 
         try:
-            prompt = build_prompt(metadata, bills)
+            prompt = build_prompt(metadata, selected_bills)
             result = call_gemini(client, prompt)
-            row_values = to_sheet_row(legislator, result, bills)
+            row_values = to_sheet_row(legislator, result, selected_bills)
             write_profile(service, existing_profiles, row_values)
             print(f"Updated profile: {legislator}")
 
-            if REQUEST_DELAY_SECONDS > 0:
-                time.sleep(REQUEST_DELAY_SECONDS)
+            if PROFILE_REQUEST_DELAY_SECONDS > 0:
+                time.sleep(PROFILE_REQUEST_DELAY_SECONDS)
 
         except Exception as exc:
             print(f"Failed profile for {legislator}: {exc}")
-            row_values = to_error_row(legislator, bills, f"Error: {exc}")
+            row_values = to_error_row(legislator, selected_bills, f"Error: {exc}")
             write_profile(service, existing_profiles, row_values)
 
 
