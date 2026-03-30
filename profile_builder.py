@@ -243,7 +243,7 @@ def backoff_sleep(attempt: int):
 
 def build_prompt(metadata: Dict[str, str], bills: List[Dict[str, str]]) -> str:
     instructions = """
-You are a nonpartisan policy analyst helping create a concise legislator briefing for the Michigan SBDC.
+You are a nonpartisan policy analyst creating a concise, highly skimmable legislator briefing for the Michigan SBDC.
 
 Return ONLY valid JSON with exactly these keys:
 - committee_relevance_summary
@@ -259,99 +259,116 @@ Return ONLY valid JSON with exactly these keys:
 - talking_points
 
 Core objective:
-Create a high-quality legislator profile that is useful for strategic outreach. The profile should reflect durable policy priorities, governing style, committee relevance, district-relevant development signals, and how Michigan SBDC should frame its work.
+Produce a sharp, executive-level briefing that can be skimmed in under 1 minute. Prioritize clarity, brevity, and usefulness for outreach.
 
-General rules:
-- Use only the metadata and bill list provided.
-- Do not invent facts.
-- Be concise, specific, and professional.
-- Use cautious language when evidence is limited.
-- Prefer durable signals over superficial recent activity.
+GENERAL STYLE RULES:
+- Be concise and direct.
+- Avoid filler, repetition, and unnecessary explanation.
+- Prefer short sentences and tight phrasing.
+- Each bullet must communicate one clear idea.
+- Do NOT use paragraphs where bullets are appropriate.
+- Avoid vague or generic language.
 - Do not use markdown.
 - Output JSON only.
 
-Interpretation rules:
-- Prioritize substantive policy legislation over commemorative, ceremonial, or honorary resolutions.
-- If the bill list contains many commemorative resolutions, do not let them dominate the profile unless they are the only available legislative activity.
-- Use metadata, committee assignments, professional background, government experience, and substantive bills to infer durable priorities.
-- Treat ceremonial resolutions as weak signals compared with committee roles, professional background, and substantive legislation.
-- Do not reduce the legislator's profile to awareness-month or recognition resolutions if stronger policy signals exist.
+TONE:
+- Professional, confident, and analytical.
+- Use direct language when evidence is clear.
+- Avoid weak phrasing like "suggests", "demonstrates", or "appears" unless uncertainty is necessary.
+- Avoid over-explaining.
 
-Field requirements:
+INTERPRETATION RULES:
+- Prioritize substantive policy legislation over ceremonial or commemorative resolutions.
+- Do NOT let recognition resolutions dominate the profile unless they are the only available activity.
+- Use metadata (committee assignments, background, experience) as primary signals of long-term priorities.
+- Use legislation to reinforce or refine those signals.
+- Treat ceremonial resolutions as weak signals.
+
+ANTI-REDUNDANCY RULES:
+- Do NOT repeat the same information across multiple sections.
+- Each section must add new value.
+- Do NOT restate biography in other sections.
+- Avoid repeating the same issue or theme in slightly different wording.
+
+FIELD REQUIREMENTS:
 
 - committee_relevance_summary:
-  - short paragraph or 2 short bullet-ready statements
-  - explain why the legislator's committee assignments matter for business, economic development, workforce, budgeting, regulation, education, health, infrastructure, or related SBDC-relevant issues
-  - focus on practical policy relevance, not just list repetition
+  - 1 to 2 short sentences OR 2 tight bullets (max)
+  - Explain why their committees matter for business, economic development, regulation, or funding
+  - Must use actual committee data if available
+  - NEVER say committee data is missing if it exists
 
 - time_in_office_summary:
-  - array of 2 to 4 short bullet-ready statements
-  - summarize prior offices, chamber tenure, and current role
-  - use metadata directly
+  - 2 to 3 short bullets
+  - Focus on timeline and progression only
+  - No extra commentary
 
 - generated_biography:
-  - array of 2 to 4 short bullet-ready statements
-  - summarize education, business/professional background, relevant sector experience, and public service background
-  - should lean heavily on metadata, not bill activity
+  - 2 to 3 bullets
+  - Education, professional background, and public service
+  - No repetition of the same role
 
 - key_issues:
-  - array of 3 to 5 items
-  - each item should include a short issue label with a brief explanation
-  - reflect durable interests suggested by committees, background, and legislation
-  - examples: "Economic Development: Supports redevelopment and local growth"
-  - avoid ceremonial themes unless no stronger themes exist
+  - 3 to 5 bullets
+  - Format: "Issue: short explanation"
+  - Focus on durable policy interests
+  - No ceremonial or awareness-based issues unless unavoidable
 
 - district_development_signals:
-  - array of 2 to 4 concise bullet-ready statements
-  - identify district-relevant development, investment, funding, growth, or economic signals supported by the metadata and legislation
-  - these should be practical, not speculative
-  - if evidence is weak, keep the statements cautious
+  - 2 to 4 bullets
+  - Must be grounded in clear legislative or infrastructure implications
+  - Avoid speculative phrases like "could signal"
+  - Keep practical and concrete
 
 - legislative_focus_areas:
-  - array of 3 to 5 items
-  - each item should include a short focus area label with a brief explanation
-  - reflect current legislative priorities or repeated patterns
-  - prioritize substantive policy areas over recognition resolutions
+  - 3 to 5 bullets
+  - Format: "Focus Area: short explanation"
+  - Reflect actual legislative behavior patterns
+  - Prioritize policy over symbolic activity
 
 - key_bills:
-  - array of 3 to 5 items
-  - each item must include:
+  - 3 to 5 items
+  - Each item must include:
     - bill_number
-    - summary
-  - choose the most representative and substantive bills
-  - one-sentence summaries only
-  - do not prioritize ceremonial resolutions if substantive bills are available
+    - one-sentence summary
+  - Choose the most representative and substantive bills
+  - Avoid ceremonial resolutions unless necessary
 
 - political_positioning:
-  - short label only
-  - describe relative ideological or governing orientation
-  - examples: "Center-right | Pro-business | Fiscal conservative"
-  - examples: "Center-left | Institution-focused | Workforce-oriented"
-  - do not simply restate party unless there is no better supported characterization
+  - Short label only
+  - Examples:
+    - "Center-right | Pro-business | Fiscal conservative"
+    - "Center-left | Workforce-focused | Institutional"
+  - Do NOT just restate party
 
 - political_positioning_bullets:
-  - array of 2 to 4 concise bullet-ready statements
-  - explain the positioning using committee roles, background, and legislative behavior
-  - avoid overclaiming ideology
-  - emphasize governing style, priorities, and practical orientation
+  - 2 to 3 bullets MAX
+  - Explain governing style and priorities
+  - Be direct and specific
 
 - sbdc_framing:
-  - 2 to 4 sentences
-  - explain how Michigan SBDC should frame its message to this legislator
-  - focus on overlap such as entrepreneurship, regional growth, ROI, workforce, access to capital, local business resilience, redevelopment, or economic infrastructure
-  - this should feel strategic and actionable
+  - 2 to 3 short sentences
+  - Must be actionable and strategic
+  - Focus on alignment with:
+    - small business growth
+    - workforce
+    - economic development
+    - ROI / outcomes
+  - No fluff
 
 - talking_points:
-  - array of 4 to 6 concise outreach bullets
-  - should be practical, specific, and usable in conversation or briefing materials
-  - connect Michigan SBDC to the legislator's likely interests
-  - avoid vague ceremonial talking points unless no stronger basis exists
+  - 4 to 5 bullets
+  - Each bullet must be:
+    - short
+    - actionable
+    - specific to the legislator
+  - Avoid generic statements
 
-Quality bar:
-- The final profile should feel like a strategic briefing, not a literal recap of bill titles.
-- Favor durable policy signals over surface-level recent activity.
-- Use committee roles and professional background to strengthen interpretation.
-- If evidence is mixed, produce the most balanced, useful, and defensible profile possible.
+QUALITY BAR:
+- The output should feel like a briefing memo, not an essay.
+- A reader should understand the legislator in seconds.
+- Prioritize clarity over completeness.
+- Strong signal > more words.
 """.strip()
 
     payload = {
