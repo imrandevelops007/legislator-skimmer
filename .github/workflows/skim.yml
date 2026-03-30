@@ -64,7 +64,12 @@ jobs:
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           ONLY_LEGISLATOR: "Mark Huizenga"
         run: |
           python report_generator.py
+
+      - name: Upload generated reports as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: legislator-reports
+          path: generated_reports/
