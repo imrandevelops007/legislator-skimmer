@@ -24,28 +24,28 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-#      - name: Run main collector
-#        env:
-#          SHEET_ID: ${{ secrets.SHEET_ID }}
-#          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-#        run: |
-#          python main.py
+      - name: Run main collector
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python main.py
 
-#      - name: Run analyzer
-#        env:
-#          SHEET_ID: ${{ secrets.SHEET_ID }}
-#          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-#          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-#          DRY_RUN: "false"
-#          GEMINI_MODEL: "gemini-2.5-flash"
-#          BATCH_SIZE: "20"
-#          MAX_ITEMS_PER_RUN: "20"
-#          MAX_PAGE_CHARS: "4000"
-#          GEMINI_MAX_RETRIES: "3"
-#          REQUEST_DELAY_SECONDS: "3"
-#          STOP_ON_QUOTA_EXHAUSTION: "true"
-#        run: |
-#          python analyze.py
+      - name: Run analyzer
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DRY_RUN: "false"
+          GEMINI_MODEL: "gemini-2.5-flash"
+          BATCH_SIZE: "20"
+          MAX_ITEMS_PER_RUN: "20"
+          MAX_PAGE_CHARS: "4000"
+          GEMINI_MAX_RETRIES: "3"
+          REQUEST_DELAY_SECONDS: "3"
+          STOP_ON_QUOTA_EXHAUSTION: "true"
+        run: |
+          python analyze.py
 
       - name: Run profile builder
         env:
