@@ -49,7 +49,7 @@ OUTPUT_DIR = "generated_reports"
 # N  Political_Positioning_Source
 # O  Verification_Notes
 # P  Image_URL
-# Q  Counties   <-- optional new column
+# Q  Counties
 
 # Profiles_Dynamic columns:
 # A  Legislator
@@ -121,17 +121,18 @@ def slugify(name: str) -> str:
     return value or "report"
 
 
-def build_location_line(region: str, counties: str) -> str:
-    region = (region or "").strip()
-    counties = (counties or "").strip()
+def format_counties(counties: str, max_display: int = 3) -> str:
+    parts = [c.strip() for c in (counties or "").split("|") if c.strip()]
 
-    if region and counties:
-        return f"{region} • {counties}"
-    if region:
-        return region
-    if counties:
-        return counties
-    return ""
+    if not parts:
+        return ""
+
+    if len(parts) <= max_display:
+        return ", ".join(parts)
+
+    shown = parts[:max_display]
+    remaining = len(parts) - max_display
+    return f"{', '.join(shown)} + {remaining} more"
 
 
 # =========================
@@ -208,7 +209,7 @@ def load_metadata(service) -> Dict[str, Dict[str, str]]:
             "Political_Positioning_Source": row[13].strip(),
             "Verification_Notes": row[14].strip(),
             "Image_URL": row[15].strip(),
-            "Counties": row[16].strip(),  # optional
+            "Counties": row[16].strip(),
         }
 
     return out
@@ -264,7 +265,16 @@ def render_html(row: Dict[str, str]) -> str:
         chamber_label = "House"
 
     party_label = format_party_label(row["Party"])
-    location_line = build_location_line(row.get("Region", ""), row.get("Counties", ""))
+    region = row.get("Region", "").strip()
+    counties = format_counties(row.get("Counties", ""))
+
+    location_line = ""
+    if region and counties:
+        location_line = f"{region} • {counties}"
+    elif region:
+        location_line = region
+    elif counties:
+        location_line = counties
 
     return template.render(
         name=row["Legislator"],
