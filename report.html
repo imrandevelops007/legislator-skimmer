@@ -5,30 +5,38 @@
     body {
       font-family: Arial, sans-serif;
       margin: 40px;
-      line-height: 1.4;
+      line-height: 1.35;
+      font-size: 13px;
+      color: #111;
     }
 
     .header {
       border-bottom: 3px solid {{ party_color }};
-      padding-bottom: 10px;
-      margin-bottom: 20px;
+      padding-bottom: 12px;
+      margin-bottom: 18px;
+      overflow: auto;
     }
 
     .name {
       font-size: 28px;
       font-weight: bold;
       color: {{ party_color }};
+      margin-bottom: 4px;
+    }
+
+    .subhead {
+      font-size: 15px;
     }
 
     .section-title {
       font-weight: bold;
-      margin-top: 20px;
-      margin-bottom: 5px;
+      margin-top: 18px;
+      margin-bottom: 6px;
       font-size: 16px;
     }
 
     .bullet {
-      margin-left: 15px;
+      margin-left: 14px;
       margin-bottom: 4px;
     }
 
@@ -36,17 +44,21 @@
       float: right;
       width: 120px;
       border-radius: 6px;
+      margin-left: 18px;
     }
 
+    p {
+      margin: 0 0 6px 0;
+    }
   </style>
 </head>
 
 <body>
 
 <div class="header">
-  <div class="name">{{ name }}</div>
-  <div>{{ chamber }} District {{ district }}</div>
   <img class="photo" src="{{ image_url }}">
+  <div class="name">{{ name }}</div>
+  <div class="subhead">{{ chamber }} District {{ district }}</div>
 </div>
 
 <div class="section-title">Committee Relevance</div>
@@ -68,7 +80,7 @@
 {% endfor %}
 
 <div class="section-title">District Signals</div>
-{% for item in district %}
+{% for item in district_signals %}
 <div class="bullet">• {{ item }}</div>
 {% endfor %}
 
