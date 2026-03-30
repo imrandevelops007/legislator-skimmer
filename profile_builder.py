@@ -4,7 +4,7 @@ import time
 import random
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -24,14 +24,29 @@ MAX_BILLS_PER_LEGISLATOR = int(os.getenv("MAX_BILLS_PER_LEGISLATOR", "12"))
 PROFILE_MAX_RETRIES = int(os.getenv("PROFILE_MAX_RETRIES", "5"))
 PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "3"))
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
-
-# Require at least this many processed items before generating a profile
 MIN_BILLS_REQUIRED = int(os.getenv("MIN_BILLS_REQUIRED", "3"))
 
-# Sheet ranges
-METADATA_RANGE = "Legislator_Metadata!A2:O"
+METADATA_RANGE = "Legislator_Metadata!A2:P"
 ACTIVITY_RANGE = "Activity_Items!A2:I"
 PROFILES_RANGE = "Profiles_Dynamic!A2:Q"
+
+# Legislator_Metadata columns:
+# A  Legislator
+# B  Chamber
+# C  District
+# D  Party
+# E  First_Elected_to_Current_Chamber
+# F  Current_Term_Start
+# G  Current_Term_End
+# H  Time_In_Office_Note
+# I  Education
+# J  Professional_Background
+# K  Government_Experience
+# L  Committee_Assignments
+# M  Key_Issues_Source
+# N  Political_Positioning_Source
+# O  Verification_Notes
+# P  Image_URL
 
 # Profiles_Dynamic columns:
 # A  Legislator
@@ -103,7 +118,7 @@ def load_metadata(service) -> Dict[str, Dict[str, str]]:
     out: Dict[str, Dict[str, str]] = {}
 
     for row in rows:
-        row = pad_row(row, 15)
+        row = pad_row(row, 16)
         legislator = row[0].strip()
         if not legislator:
             continue
@@ -124,6 +139,7 @@ def load_metadata(service) -> Dict[str, Dict[str, str]]:
             "key_issues_source": row[12].strip(),
             "political_positioning_source": row[13].strip(),
             "verification_notes": row[14].strip(),
+            "image_url": row[15].strip(),
         }
 
     return out
@@ -158,7 +174,6 @@ def load_activity(service) -> Dict[str, List[Dict[str, str]]]:
             }
         )
 
-    # newest first
     for legislator in out:
         out[legislator].sort(key=lambda x: x["timestamp"], reverse=True)
 
@@ -182,10 +197,6 @@ def load_existing_profiles(service) -> Dict[str, int]:
 # Bill prioritization
 # =========================
 def classify_bill_priority(bill_number: str) -> int:
-    """
-    Lower number = higher priority.
-    Prioritize substantive policy bills first.
-    """
     bill_number = (bill_number or "").upper().strip()
 
     if re.match(r"^(HB|SB)\s+\d+$", bill_number):
@@ -201,10 +212,6 @@ def classify_bill_priority(bill_number: str) -> int:
 
 
 def select_best_bills(bills: List[Dict[str, str]], max_bills: int) -> List[Dict[str, str]]:
-    """
-    Prefer substantive bills, then secondary resolutions, then ceremonial items.
-    Keep newer items first within each bucket.
-    """
     buckets: Dict[int, List[Dict[str, str]]] = {1: [], 2: [], 3: [], 4: []}
 
     for bill in bills:
@@ -259,7 +266,7 @@ Return ONLY valid JSON with exactly these keys:
 - talking_points
 
 Core objective:
-Produce a sharp, executive-level briefing that can be skimmed in under 1 minute. Prioritize clarity, brevity, and usefulness for outreach.
+Produce a sharp, executive-level briefing that can be skimmed in under 30 seconds. Prioritize clarity, brevity, and usefulness for outreach.
 
 GENERAL STYLE RULES:
 - Be concise and direct.
@@ -277,6 +284,12 @@ TONE:
 - Avoid weak phrasing like "suggests", "demonstrates", or "appears" unless uncertainty is necessary.
 - Avoid over-explaining.
 
+GENERAL RULES:
+- Never ignore available metadata fields.
+- If committee_assignments is provided, it must be used.
+- Use only the metadata and bill list provided.
+- Do not invent facts.
+
 INTERPRETATION RULES:
 - Prioritize substantive policy legislation over ceremonial or commemorative resolutions.
 - Do NOT let recognition resolutions dominate the profile unless they are the only available activity.
@@ -293,10 +306,12 @@ ANTI-REDUNDANCY RULES:
 FIELD REQUIREMENTS:
 
 - committee_relevance_summary:
+  - REQUIRED: Use the committee_assignments field from metadata if it is present
+  - DO NOT say committee information is missing unless the field is completely empty
   - 1 to 2 short sentences OR 2 tight bullets (max)
   - Explain why their committees matter for business, economic development, regulation, or funding
-  - Must use actual committee data if available
-  - NEVER say committee data is missing if it exists
+  - Focus on practical policy relevance, not just list repetition
+  - This section must be populated if committee data exists
 
 - time_in_office_summary:
   - 2 to 3 short bullets
@@ -327,12 +342,15 @@ FIELD REQUIREMENTS:
   - Prioritize policy over symbolic activity
 
 - key_bills:
-  - 3 to 5 items
-  - Each item must include:
+  - REQUIRED
+  - array of 3 to 5 items
+  - each item must include:
     - bill_number
-    - one-sentence summary
-  - Choose the most representative and substantive bills
-  - Avoid ceremonial resolutions unless necessary
+    - summary
+  - choose the most representative and substantive bills
+  - one-sentence summaries only
+  - do not prioritize ceremonial resolutions if substantive bills are available
+  - this field must never be empty if bills are provided
 
 - political_positioning:
   - Short label only
@@ -428,19 +446,53 @@ def join_pipe(items: Any) -> str:
     return " | ".join([str(x).strip() for x in items if str(x).strip()])
 
 
-def normalize_key_bills(items: Any) -> str:
-    if not isinstance(items, list):
-        return ""
+def normalize_key_bills(items: Any, fallback_bills: List[Dict[str, str]]) -> str:
+    """
+    Convert Gemini key_bills output into:
+    BILL_NUMBER::summary || BILL_NUMBER::summary
 
-    out = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        bill_number = str(item.get("bill_number", "")).strip()
-        summary = str(item.get("summary", "")).strip()
-        if bill_number and summary:
-            out.append(f"{bill_number}::{summary}")
-    return " || ".join(out)
+    If Gemini returns nothing usable, fall back to selected bills.
+    """
+    out: List[str] = []
+
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            bill_number = str(
+                item.get("bill_number")
+                or item.get("bill")
+                or item.get("number")
+                or ""
+            ).strip()
+
+            summary = str(
+                item.get("summary")
+                or item.get("bill_summary")
+                or item.get("description")
+                or ""
+            ).strip()
+
+            if bill_number and summary:
+                out.append(f"{bill_number}::{summary}")
+
+    if out:
+        return " || ".join(out)
+
+    fallback_out: List[str] = []
+    for bill in fallback_bills[:5]:
+        bill_number = bill.get("bill_number", "").strip()
+        bill_title = bill.get("bill_title", "").strip()
+        bill_summary = bill.get("bill_summary", "").strip()
+
+        if bill_number and bill_summary:
+            if bill_title:
+                fallback_out.append(f"{bill_number}::{bill_title} — {bill_summary}")
+            else:
+                fallback_out.append(f"{bill_number}::{bill_summary}")
+
+    return " || ".join(fallback_out)
 
 
 def to_sheet_row(
@@ -454,7 +506,7 @@ def to_sheet_row(
     key_issues = join_pipe(result.get("key_issues", []))
     district_development_signals = join_pipe(result.get("district_development_signals", []))
     legislative_focus_areas = join_pipe(result.get("legislative_focus_areas", []))
-    key_bills = normalize_key_bills(result.get("key_bills", []))
+    key_bills = normalize_key_bills(result.get("key_bills", []), bills)
     political_positioning = str(result.get("political_positioning", "")).strip()
     political_positioning_bullets = join_pipe(result.get("political_positioning_bullets", []))
     sbdc_framing = str(result.get("sbdc_framing", "")).strip()
@@ -562,8 +614,10 @@ def main():
         try:
             prompt = build_prompt(metadata, selected_bills)
             result = call_gemini(client, prompt)
+
             row_values = to_sheet_row(legislator, result, selected_bills)
             write_profile(service, existing_profiles, row_values)
+
             print(f"Updated profile: {legislator}")
 
             if PROFILE_REQUEST_DELAY_SECONDS > 0:
