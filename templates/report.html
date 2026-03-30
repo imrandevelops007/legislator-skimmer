@@ -4,8 +4,8 @@
   <style>
     body {
       font-family: Arial, sans-serif;
-      margin: 40px;
-      line-height: 1.35;
+      margin: 34px 40px;
+      line-height: 1.32;
       font-size: 13px;
       color: #111;
     }
@@ -13,8 +13,15 @@
     .header {
       border-bottom: 3px solid {{ party_color }};
       padding-bottom: 12px;
-      margin-bottom: 18px;
+      margin-bottom: 16px;
       overflow: auto;
+    }
+
+    .photo {
+      float: right;
+      width: 118px;
+      border-radius: 6px;
+      margin-left: 18px;
     }
 
     .name {
@@ -26,11 +33,17 @@
 
     .subhead {
       font-size: 15px;
+      margin-bottom: 3px;
+    }
+
+    .meta-line {
+      font-size: 13px;
+      margin-bottom: 2px;
     }
 
     .section-title {
       font-weight: bold;
-      margin-top: 18px;
+      margin-top: 16px;
       margin-bottom: 6px;
       font-size: 16px;
     }
@@ -40,15 +53,12 @@
       margin-bottom: 4px;
     }
 
-    .photo {
-      float: right;
-      width: 120px;
-      border-radius: 6px;
-      margin-left: 18px;
-    }
-
     p {
       margin: 0 0 6px 0;
+    }
+
+    .strong-line {
+      font-weight: bold;
     }
   </style>
 </head>
@@ -59,6 +69,14 @@
   <img class="photo" src="{{ image_url }}">
   <div class="name">{{ name }}</div>
   <div class="subhead">{{ chamber }} District {{ district }}</div>
+
+  {% if party_label %}
+  <div class="meta-line"><span class="strong-line">Party:</span> {{ party_label }}</div>
+  {% endif %}
+
+  {% if location_line %}
+  <div class="meta-line"><span class="strong-line">Region:</span> {{ location_line }}</div>
+  {% endif %}
 </div>
 
 <div class="section-title">Committee Relevance</div>
