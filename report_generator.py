@@ -1,12 +1,10 @@
 import os
 import json
 import re
-import tempfile
 from typing import List, Dict
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 from jinja2 import Environment, FileSystemLoader
 from weasyprint import HTML
 
@@ -15,16 +13,14 @@ from weasyprint import HTML
 # Config
 # =========================
 SHEET_ID = os.environ["SHEET_ID"]
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
 METADATA_RANGE = "Legislator_Metadata!A2:P"
 PROFILES_RANGE = "Profiles_Dynamic!A2:Q"
+
+OUTPUT_DIR = "generated_reports"
 
 
 # Legislator_Metadata columns:
@@ -114,10 +110,6 @@ def get_creds():
 
 def get_sheets_service():
     return build("sheets", "v4", credentials=get_creds())
-
-
-def get_drive_service():
-    return build("drive", "v3", credentials=get_creds())
 
 
 def sheets_get_values(service, rng: str) -> List[List[str]]:
@@ -239,31 +231,10 @@ def write_pdf(html_string: str, output_path: str) -> None:
 
 
 # =========================
-# Drive upload
-# =========================
-def upload_to_drive(drive_service, file_path: str, filename: str) -> str:
-    metadata = {
-        "name": filename,
-        "parents": [DRIVE_FOLDER_ID],
-    }
-
-    media = MediaFileUpload(file_path, mimetype="application/pdf")
-
-    created = (
-        drive_service.files()
-        .create(body=metadata, media_body=media, fields="id, webViewLink")
-        .execute()
-    )
-
-    return created.get("webViewLink", "")
-
-
-# =========================
 # Main
 # =========================
 def main():
     sheets_service = get_sheets_service()
-    drive_service = get_drive_service()
 
     metadata_by_legislator = load_metadata(sheets_service)
     profiles_by_legislator = load_profiles(sheets_service)
@@ -275,6 +246,11 @@ def main():
 
     print(f"Generating reports for {len(legislators)} legislator(s)...")
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    generated_count = 0
+    skipped_count = 0
+
     for legislator in legislators:
         merged = {}
         merged.update(metadata_by_legislator[legislator])
@@ -282,19 +258,20 @@ def main():
 
         if not merged.get("Image_URL"):
             print(f"Skipping {legislator}: missing Image_URL in Legislator_Metadata.")
+            skipped_count += 1
             continue
 
         html = render_html(merged)
 
         slug = slugify(legislator)
         filename = f"{slug}.pdf"
+        output_path = os.path.join(OUTPUT_DIR, filename)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, filename)
-            write_pdf(html, output_path)
-            link = upload_to_drive(drive_service, output_path, filename)
+        write_pdf(html, output_path)
+        print(f"Generated report for {legislator}: {output_path}")
+        generated_count += 1
 
-        print(f"Uploaded report for {legislator}: {link}")
+    print(f"Done. Generated={generated_count}, Skipped={skipped_count}")
 
 
 if __name__ == "__main__":
