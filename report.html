@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 40px;
+      line-height: 1.4;
+    }
+
+    .header {
+      border-bottom: 3px solid {{ party_color }};
+      padding-bottom: 10px;
+      margin-bottom: 20px;
+    }
+
+    .name {
+      font-size: 28px;
+      font-weight: bold;
+      color: {{ party_color }};
+    }
+
+    .section-title {
+      font-weight: bold;
+      margin-top: 20px;
+      margin-bottom: 5px;
+      font-size: 16px;
+    }
+
+    .bullet {
+      margin-left: 15px;
+      margin-bottom: 4px;
+    }
+
+    .photo {
+      float: right;
+      width: 120px;
+      border-radius: 6px;
+    }
+
+  </style>
+</head>
+
+<body>
+
+<div class="header">
+  <div class="name">{{ name }}</div>
+  <div>{{ chamber }} District {{ district }}</div>
+  <img class="photo" src="{{ image_url }}">
+</div>
+
+<div class="section-title">Committee Relevance</div>
+<p>{{ committee }}</p>
+
+<div class="section-title">Time in Office</div>
+{% for item in time_in_office %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+<div class="section-title">Biography</div>
+{% for item in bio %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+<div class="section-title">Key Issues</div>
+{% for item in issues %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+<div class="section-title">District Signals</div>
+{% for item in district %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+<div class="section-title">Legislative Focus</div>
+{% for item in focus %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+<div class="section-title">Key Bills</div>
+{% for item in bills %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+<div class="section-title">Political Positioning</div>
+<p><b>{{ positioning }}</b></p>
+{% for item in positioning_notes %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+<div class="section-title">SBDC Framing</div>
+<p>{{ sbdc }}</p>
+
+<div class="section-title">Talking Points</div>
+{% for item in talking %}
+<div class="bullet">• {{ item }}</div>
+{% endfor %}
+
+</body>
+</html>
