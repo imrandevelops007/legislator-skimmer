@@ -6,3 +6,5 @@ google-genai
 beautifulsoup4
 requests
 playwright
+weasyprint
+jinja2
