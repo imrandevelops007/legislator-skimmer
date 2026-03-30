@@ -59,3 +59,12 @@ jobs:
           ONLY_LEGISLATOR: "Mark Huizenga"
         run: |
           python profile_builder.py
+
+      - name: Generate PDF reports
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          ONLY_LEGISLATOR: "Mark Huizenga"
+        run: |
+          python report_generator.py
