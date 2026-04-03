@@ -216,6 +216,11 @@ def bill_is_substantive(bill_number: str) -> bool:
     return bool(re.match(r"^(HB|SB|HCR|SCR)\s+\d+$", bill_number))
 
 
+def bill_is_ceremonial(bill_number: str) -> bool:
+    bill_number = (bill_number or "").upper().strip()
+    return bool(re.match(r"^(HR|SR)\s+\d+$", bill_number))
+
+
 def select_best_bills(bills: List[Dict[str, str]], max_bills: int) -> List[Dict[str, str]]:
     buckets: Dict[int, List[Dict[str, str]]] = {1: [], 2: [], 3: [], 4: []}
 
@@ -254,6 +259,9 @@ def backoff_sleep(attempt: int):
 
 
 def build_prompt(metadata: Dict[str, str], bills: List[Dict[str, str]]) -> str:
+    substantive_bills = [b for b in bills if bill_is_substantive(b.get("bill_number", ""))]
+    ceremonial_bills = [b for b in bills if bill_is_ceremonial(b.get("bill_number", ""))]
+
     instructions = """
 You are a nonpartisan policy analyst creating a one-page executive briefing for Michigan SBDC outreach.
 
@@ -280,70 +288,94 @@ NON-NEGOTIABLE STYLE RULES:
 - No filler.
 - No hedging unless uncertainty is unavoidable.
 - Do not repeat the same fact across sections.
-- Do not use ceremonial resolutions as primary evidence if substantive bills exist.
-- Prefer enacted-policy style bills, appropriations, regulatory, workforce, tax, infrastructure, health, education, housing, economic development, licensing, or government operations bills over recognition resolutions.
+- Do not restate the same theme in slightly different wording.
+- Strong signal matters more than exhaustive coverage.
 
-SECTION RULES:
+BILL INTERPRETATION RULES:
+- Substantive legislation should carry much more weight than ceremonial resolutions.
+- Ceremonial or recognition resolutions such as HR and SR should NOT define the legislator's core policy focus.
+- If only ceremonial items are available, include them only as weak supporting evidence.
+- If only ceremonial items are available, prioritize committee roles, prior government experience, professional background, and durable issue cues over the resolution topics themselves.
+- Do not let awareness days, commemorations, or honorary recognitions drive key issues, legislative focus, or political positioning unless there is no stronger evidence.
+- When substantive bills exist, key_bills must primarily use those substantive bills.
 
-committee_relevance_summary
+COMMITTEE RELEVANCE RULES:
 - String, not array
 - Max 2 sentences
-- Must use committee_assignments if present
-- If a leadership role is present, lead with that
-- Focus on budget, regulation, commerce, workforce, infrastructure, health, education, or oversight relevance
+- Make it sharp and executive
+- Lead with leadership roles if present
+- Focus on practical relevance to regulation, economic development, funding, workforce, local government, infrastructure, agriculture, education, healthcare, or business climate
+- Do not just list committees without explaining why they matter
 
-time_in_office_summary
+TIME IN OFFICE RULES:
 - Array of 2 to 3 bullets
 - Timeline only
-- No interpretation
+- No commentary
 
-generated_biography
+BIOGRAPHY RULES:
 - Array of 2 to 3 bullets
-- Education, profession, prior public service
+- Education, profession, public service
 - Tight and factual
 
-key_issues
+KEY ISSUES RULES:
 - Array of 3 to 5 bullets
 - Format exactly: "Issue: explanation"
-- Durable issue interests only
+- Durable policy interests only
+- If bill evidence is weak, infer mostly from committees, background, and governance roles
 
-district_development_signals
+DISTRICT DEVELOPMENT SIGNALS RULES:
 - Array of 2 to 4 bullets
-- Concrete economic or district implications only
-- No speculative language like "could signal", "may suggest", "appears to"
+- Concrete economic, workforce, infrastructure, agriculture, education, local government, or community-development implications only
+- No speculative phrases like "could signal", "may suggest", or "appears to"
 
-legislative_focus_areas
+LEGISLATIVE FOCUS RULES:
 - Array of 3 to 5 bullets
 - Format exactly: "Focus Area: explanation"
-- Based on actual legislative pattern
+- Reflect actual policy orientation, not ceremonial recognition topics
+- If bill evidence is weak, rely more on committee and background signals
 
-key_bills
+KEY BILLS RULES:
 - Array of 3 to 5 objects
 - Each object must contain:
   - bill_number
   - summary
 - One sentence each
-- Must prioritize substantive legislation when available
+- Prefer HB/SB, then HCR/SCR
+- HR/SR should only appear when substantive bills are unavailable
+- If only ceremonial items are available, summaries should stay factual and brief and should not overstate policy significance
 
-political_positioning
+POLITICAL POSITIONING RULES:
 - One short label only
 - Format like:
   "Center-right | Pro-business | Budget-focused"
   "Center-left | Workforce-focused | Institutional"
+- Do not just restate party
 
-political_positioning_bullets
+POLITICAL POSITIONING BULLETS RULES:
 - Array of 2 to 3 bullets
-- Governing style and practical priorities
-- Do not restate party label
+- Focus on governing style and practical priorities
+- Do not over-read ceremonial bills
 
-sbdc_framing
+SBDC FRAMING RULES:
 - String, 2 to 3 short sentences max
 - Must be specific to this legislator
-- Explain what kind of business story, district outcome, funding argument, or ROI framing is most likely to resonate
+- Tie the framing to the strongest concrete signals in the input
+- Good anchors include:
+  - regulatory relief
+  - small business growth
+  - rural entrepreneurship
+  - workforce pipelines
+  - local economic development
+  - education-to-workforce pathways
+  - agriculture or supply chain resilience
+  - efficient local service delivery
+- Avoid generic phrases that could fit almost anyone
+- Explain what kind of business story, district outcome, or ROI framing is most likely to resonate with this legislator
 
-talking_points
+TALKING POINTS RULES:
 - Array of 4 to 5 bullets
 - Each bullet must be short, actionable, and specific to the legislator
+- Avoid vague outreach language
 
 QUALITY FILTER:
 Before finalizing, remove:
@@ -359,6 +391,13 @@ Use only the metadata and bill list below. Do not invent facts.
     payload = {
         "metadata": metadata,
         "selected_recent_bills": bills,
+        "signal_summary": {
+            "selected_bill_count": len(bills),
+            "substantive_bill_count": len(substantive_bills),
+            "ceremonial_bill_count": len(ceremonial_bills),
+            "has_substantive_bills": len(substantive_bills) > 0,
+            "has_only_ceremonial_bills": len(substantive_bills) == 0 and len(ceremonial_bills) > 0,
+        },
     }
 
     return f"{instructions}\n\nINPUT:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
@@ -451,14 +490,27 @@ def clean_summary_text(text: str, max_sentences: int = 2) -> str:
     return " ".join(parts[:max_sentences])
 
 
-def split_into_short_sentences(text: str, max_sentences: int = 3) -> str:
-    text = clean_bullet_text(text)
-    if not text:
-        return ""
+def normalize_committee_summary(text: str) -> str:
+    text = clean_summary_text(text, max_sentences=2)
+    text = re.sub(r"^As a member of\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^As a\s+", "", text, flags=re.IGNORECASE)
+    return text.strip()
 
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    parts = [p.strip() for p in parts if p.strip()]
-    return " ".join(parts[:max_sentences])
+
+def normalize_sbdc_framing(text: str) -> str:
+    text = clean_summary_text(text, max_sentences=3)
+
+    replacements = {
+        "Frame SBDC outreach around how services provide tangible local economic impact": "Frame SBDC outreach around tangible local economic impact",
+        "Emphasize success stories that highlight": "Use success stories that highlight",
+        "Discuss how SBDC services can help": "Show how SBDC support can help",
+        "Highlight how SBDC services can help": "Show how SBDC services help",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return text.strip()
 
 
 # =========================
@@ -470,13 +522,18 @@ def join_pipe(items: Any) -> str:
     return " | ".join([str(x).strip() for x in items if str(x).strip()])
 
 
-def normalize_key_bills(items: Any, fallback_bills: List[Dict[str, str]]) -> str:
+def normalize_key_bills(items: Any, selected_bills: List[Dict[str, str]]) -> str:
     """
     Convert Gemini key_bills output into:
     BILL_NUMBER::summary || BILL_NUMBER::summary
 
-    If Gemini returns nothing usable, fall back to selected bills.
+    Fallback logic:
+    1. Prefer substantive selected bills
+    2. If none exist, allow ceremonial selected bills
     """
+    substantive_selected = [b for b in selected_bills if bill_is_substantive(b.get("bill_number", ""))]
+    ceremonial_selected = [b for b in selected_bills if bill_is_ceremonial(b.get("bill_number", ""))]
+
     out: List[str] = []
 
     if isinstance(items, list):
@@ -500,23 +557,33 @@ def normalize_key_bills(items: Any, fallback_bills: List[Dict[str, str]]) -> str
 
             summary = clean_summary_text(summary, max_sentences=1)
 
-            if bill_number and summary:
-                out.append(f"{bill_number}::{summary}")
+            if not bill_number or not summary:
+                continue
+
+            # If substantive selected bills exist, ignore ceremonial Gemini choices
+            if substantive_selected and bill_is_ceremonial(bill_number):
+                continue
+
+            out.append(f"{bill_number}::{summary}")
 
     if out:
         return " || ".join(out[:5])
 
+    fallback_source = substantive_selected if substantive_selected else ceremonial_selected if ceremonial_selected else selected_bills
+
     fallback_out: List[str] = []
-    for bill in fallback_bills[:5]:
+    for bill in fallback_source[:5]:
         bill_number = bill.get("bill_number", "").strip()
         bill_title = clean_bullet_text(bill.get("bill_title", "").strip())
         bill_summary = clean_summary_text(bill.get("bill_summary", "").strip(), max_sentences=1)
 
-        if bill_number and bill_summary:
-            if bill_title:
-                fallback_out.append(f"{bill_number}::{bill_title} — {bill_summary}")
-            else:
-                fallback_out.append(f"{bill_number}::{bill_summary}")
+        if not bill_number or not bill_summary:
+            continue
+
+        if bill_title:
+            fallback_out.append(f"{bill_number}::{bill_title} — {bill_summary}")
+        else:
+            fallback_out.append(f"{bill_number}::{bill_summary}")
 
     return " || ".join(fallback_out)
 
@@ -526,9 +593,8 @@ def to_sheet_row(
     result: Dict[str, Any],
     bills: List[Dict[str, str]],
 ) -> List[str]:
-    committee_relevance_summary = clean_summary_text(
-        str(result.get("committee_relevance_summary", "")).strip(),
-        max_sentences=2,
+    committee_relevance_summary = normalize_committee_summary(
+        str(result.get("committee_relevance_summary", "")).strip()
     )
 
     time_in_office_summary = join_pipe(
@@ -551,9 +617,7 @@ def to_sheet_row(
         clean_bullet_list(result.get("legislative_focus_areas", []), 5)
     )
 
-    substantive_bills = [b for b in bills if bill_is_substantive(b.get("bill_number", ""))]
-    fallback_bills = substantive_bills if substantive_bills else bills
-    key_bills = normalize_key_bills(result.get("key_bills", []), fallback_bills)
+    key_bills = normalize_key_bills(result.get("key_bills", []), bills)
 
     political_positioning = clean_bullet_text(
         str(result.get("political_positioning", "")).strip()
@@ -563,9 +627,8 @@ def to_sheet_row(
         clean_bullet_list(result.get("political_positioning_bullets", []), 3)
     )
 
-    sbdc_framing = split_into_short_sentences(
-        str(result.get("sbdc_framing", "")).strip(),
-        max_sentences=3,
+    sbdc_framing = normalize_sbdc_framing(
+        str(result.get("sbdc_framing", "")).strip()
     )
 
     talking_points = join_pipe(
@@ -668,7 +731,12 @@ def main():
 
         selected_bills = select_best_bills(all_bills, MAX_BILLS_PER_LEGISLATOR)
 
+        substantive_count = sum(1 for b in selected_bills if bill_is_substantive(b.get("bill_number", "")))
+        ceremonial_count = sum(1 for b in selected_bills if bill_is_ceremonial(b.get("bill_number", "")))
+
         print(f"Building profile for {legislator} using {len(selected_bills)} selected bill(s)...")
+        print(f"  substantive selected: {substantive_count}")
+        print(f"  ceremonial selected: {ceremonial_count}")
         for bill in selected_bills:
             print(f"  - {bill['bill_number']}")
 
