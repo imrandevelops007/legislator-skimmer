@@ -44,7 +44,7 @@ jobs:
           GEMINI_MAX_RETRIES: "3"
           REQUEST_DELAY_SECONDS: "3"
           STOP_ON_QUOTA_EXHAUSTION: "true"
-          ONLY_LEGISLATOR: "Nancy Jenkins-Arno"
+          ONLY_LEGISLATOR: "Mary Cavanagh"
         run: |
           python analyze.py
 
