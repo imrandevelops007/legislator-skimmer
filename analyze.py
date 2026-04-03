@@ -3,7 +3,7 @@ import json
 import time
 import re
 import random
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,6 +47,10 @@ STOP_ON_QUOTA_EXHAUSTION = os.getenv("STOP_ON_QUOTA_EXHAUSTION", "true").lower()
 
 # HTTP timeout for bill page fetches
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+
+# Optional targeting / prioritization
+ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
+PRIORITY_LEGISLATOR = os.getenv("PRIORITY_LEGISLATOR", "").strip()
 
 # Activity_Items columns:
 # A: URL
@@ -165,6 +169,76 @@ def build_client() -> genai.Client:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is missing. Set it in GitHub Secrets or your local env.")
     return genai.Client(api_key=api_key)
+
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).lower()
+
+
+def row_is_candidate(row: List[str]) -> bool:
+    """
+    A candidate row is:
+    - has a URL
+    - type is blank or bill
+    - not already processed TRUE
+    - if DRY_RUN, not already marked DRY RUN
+    """
+    url = row[0].strip()
+    item_type = row[2].strip().lower()
+    processed_flag_existing = row[7].strip().upper()
+    notes_existing = row[8].strip().upper()
+
+    if not url:
+        return False
+
+    if item_type and item_type != "bill":
+        return False
+
+    if processed_flag_existing == "TRUE":
+        return False
+
+    if DRY_RUN and notes_existing == "DRY RUN":
+        return False
+
+    return True
+
+
+def get_candidate_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
+    """
+    Returns rows eligible for processing, optionally reordered by:
+    1. ONLY_LEGISLATOR filter
+    2. PRIORITY_LEGISLATOR first, then everyone else
+    """
+    candidates: List[Dict[str, Any]] = []
+
+    for idx, raw_row in enumerate(rows):
+        sheet_row_number = idx + 2  # because range starts at A2
+        row = pad_row(raw_row, 9)
+
+        if not row_is_candidate(row):
+            continue
+
+        legislator_name = row[1].strip()
+
+        if ONLY_LEGISLATOR:
+            if normalize_name(legislator_name) != normalize_name(ONLY_LEGISLATOR):
+                continue
+
+        candidates.append(
+            {
+                "sheet_row_number": sheet_row_number,
+                "row": row,
+                "legislator_name": legislator_name,
+            }
+        )
+
+    if PRIORITY_LEGISLATOR and not ONLY_LEGISLATOR:
+        priority_name = normalize_name(PRIORITY_LEGISLATOR)
+        prioritized = [c for c in candidates if normalize_name(c["legislator_name"]) == priority_name]
+        remaining = [c for c in candidates if normalize_name(c["legislator_name"]) != priority_name]
+        candidates = prioritized + remaining
+
+    return candidates
 
 
 # =========================
@@ -313,6 +387,10 @@ def main():
     print(f"GEMINI_MAX_RETRIES: {GEMINI_MAX_RETRIES}")
     print(f"REQUEST_DELAY_SECONDS: {REQUEST_DELAY_SECONDS}")
     print(f"STOP_ON_QUOTA_EXHAUSTION: {STOP_ON_QUOTA_EXHAUSTION}")
+    if ONLY_LEGISLATOR:
+        print(f"ONLY_LEGISLATOR: {ONLY_LEGISLATOR}")
+    if PRIORITY_LEGISLATOR:
+        print(f"PRIORITY_LEGISLATOR: {PRIORITY_LEGISLATOR}")
 
     service = get_sheets_service()
     rows = sheets_get_values(service, ACTIVITY_RANGE)
@@ -327,40 +405,36 @@ def main():
     client = None if DRY_RUN else build_client()
     session = requests.Session()
 
+    candidate_rows = get_candidate_rows(rows)
+    total_candidates = len(candidate_rows)
+
+    if ONLY_LEGISLATOR:
+        print(f"Found {total_candidates} eligible unprocessed row(s) for {ONLY_LEGISLATOR}.")
+    elif PRIORITY_LEGISLATOR:
+        priority_count = sum(
+            1 for c in candidate_rows
+            if normalize_name(c["legislator_name"]) == normalize_name(PRIORITY_LEGISLATOR)
+        )
+        print(
+            f"Found {total_candidates} eligible unprocessed row(s) total. "
+            f"{priority_count} belong to priority legislator {PRIORITY_LEGISLATOR}."
+        )
+    else:
+        print(f"Found {total_candidates} eligible unprocessed row(s).")
+
     try:
-        for idx, raw_row in enumerate(rows):
+        for candidate in candidate_rows:
             if processed_count >= BATCH_SIZE or processed_count >= MAX_ITEMS_PER_RUN:
                 break
 
-            # A2 is sheet row 2
-            sheet_row_number = idx + 2
-            row = pad_row(raw_row, 9)
+            sheet_row_number = candidate["sheet_row_number"]
+            row = candidate["row"]
 
             url = row[0].strip()
             legislator_name = row[1].strip()
-            item_type = row[2].strip().lower()
-            processed_flag_existing = row[7].strip().upper()
-            notes_existing = row[8].strip().upper()
-
-            if not url:
-                skipped_count += 1
-                continue
-
-            if item_type and item_type != "bill":
-                skipped_count += 1
-                continue
-
-            # Always skip truly processed rows
-            if processed_flag_existing == "TRUE":
-                skipped_count += 1
-                continue
-
-            # During DRY_RUN, skip rows already marked as DRY RUN
-            if DRY_RUN and notes_existing == "DRY RUN":
-                skipped_count += 1
-                continue
 
             print(f"\nAnalyzing row {sheet_row_number}: {url}")
+            print(f"Legislator: {legislator_name}")
 
             try:
                 bill_number = extract_bill_number_from_url(url)
@@ -399,7 +473,6 @@ def main():
                 print("Updated successfully.")
                 processed_count += 1
 
-                # Small pause between successful Gemini calls to reduce burst pressure
                 if not DRY_RUN and REQUEST_DELAY_SECONDS > 0:
                     print(f"Sleeping {REQUEST_DELAY_SECONDS:.1f}s before next item...")
                     time.sleep(REQUEST_DELAY_SECONDS)
@@ -450,6 +523,9 @@ def main():
                     print(f"Also failed to write error note back to sheet: {update_err}")
 
                 error_count += 1
+
+        # Count skipped rows only as non-candidates from the raw sheet for logging
+        skipped_count = max(0, len(rows) - total_candidates)
 
     finally:
         session.close()
