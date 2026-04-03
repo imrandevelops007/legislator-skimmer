@@ -211,6 +211,11 @@ def classify_bill_priority(bill_number: str) -> int:
     return 4
 
 
+def bill_is_substantive(bill_number: str) -> bool:
+    bill_number = (bill_number or "").upper().strip()
+    return bool(re.match(r"^(HB|SB|HCR|SCR)\s+\d+$", bill_number))
+
+
 def select_best_bills(bills: List[Dict[str, str]], max_bills: int) -> List[Dict[str, str]]:
     buckets: Dict[int, List[Dict[str, str]]] = {1: [], 2: [], 3: [], 4: []}
 
@@ -250,7 +255,7 @@ def backoff_sleep(attempt: int):
 
 def build_prompt(metadata: Dict[str, str], bills: List[Dict[str, str]]) -> str:
     instructions = """
-You are a nonpartisan policy analyst creating a concise, highly skimmable legislator briefing for the Michigan SBDC.
+You are a nonpartisan policy analyst creating a one-page executive briefing for Michigan SBDC outreach.
 
 Return ONLY valid JSON with exactly these keys:
 - committee_relevance_summary
@@ -265,128 +270,90 @@ Return ONLY valid JSON with exactly these keys:
 - sbdc_framing
 - talking_points
 
-Core objective:
-Produce a sharp, executive-level briefing that can be skimmed in under 30 seconds. Prioritize clarity, brevity, and usefulness for outreach.
+PRIMARY GOAL:
+Create a briefing that a director can skim in 20 to 30 seconds.
 
-GENERAL STYLE RULES:
-- Be concise and direct.
-- Avoid filler, repetition, and unnecessary explanation.
-- Prefer short sentences and tight phrasing.
-- Each bullet must communicate one clear idea.
-- Do NOT use paragraphs where bullets are appropriate.
-- Avoid vague or generic language.
-- Do not use markdown.
+NON-NEGOTIABLE STYLE RULES:
 - Output JSON only.
+- Be concise.
+- Prefer bullets over prose.
+- No filler.
+- No hedging unless uncertainty is unavoidable.
+- Do not repeat the same fact across sections.
+- Do not use ceremonial resolutions as primary evidence if substantive bills exist.
+- Prefer enacted-policy style bills, appropriations, regulatory, workforce, tax, infrastructure, health, education, housing, economic development, licensing, or government operations bills over recognition resolutions.
 
-TONE:
-- Professional, confident, and analytical.
-- Use direct language when evidence is clear.
-- Avoid weak phrasing like "suggests", "demonstrates", or "appears" unless uncertainty is necessary.
-- Avoid over-explaining.
+SECTION RULES:
 
-GENERAL RULES:
-- Never ignore available metadata fields.
-- If committee_assignments is provided, it must be used.
-- Use only the metadata and bill list provided.
-- Do not invent facts.
+committee_relevance_summary
+- String, not array
+- Max 2 sentences
+- Must use committee_assignments if present
+- If a leadership role is present, lead with that
+- Focus on budget, regulation, commerce, workforce, infrastructure, health, education, or oversight relevance
 
-INTERPRETATION RULES:
-- Prioritize substantive policy legislation over ceremonial or commemorative resolutions.
-- Do NOT let recognition resolutions dominate the profile unless they are the only available activity.
-- Use metadata (committee assignments, background, experience) as primary signals of long-term priorities.
-- Use legislation to reinforce or refine those signals.
-- Treat ceremonial resolutions as weak signals.
+time_in_office_summary
+- Array of 2 to 3 bullets
+- Timeline only
+- No interpretation
 
-ANTI-REDUNDANCY RULES:
-- Do NOT repeat the same information across multiple sections.
-- Each section must add new value.
-- Do NOT restate biography in other sections.
-- Avoid repeating the same issue or theme in slightly different wording.
+generated_biography
+- Array of 2 to 3 bullets
+- Education, profession, prior public service
+- Tight and factual
 
-FIELD REQUIREMENTS:
+key_issues
+- Array of 3 to 5 bullets
+- Format exactly: "Issue: explanation"
+- Durable issue interests only
 
-- committee_relevance_summary:
-  - REQUIRED: Use the committee_assignments field from metadata if it is present
-  - DO NOT say committee information is missing unless the field is completely empty
-  - 1 to 2 short sentences OR 2 tight bullets (max)
-  - Explain why their committees matter for business, economic development, regulation, or funding
-  - Focus on practical policy relevance, not just list repetition
-  - This section must be populated if committee data exists
+district_development_signals
+- Array of 2 to 4 bullets
+- Concrete economic or district implications only
+- No speculative language like "could signal", "may suggest", "appears to"
 
-- time_in_office_summary:
-  - 2 to 3 short bullets
-  - Focus on timeline and progression only
-  - No extra commentary
+legislative_focus_areas
+- Array of 3 to 5 bullets
+- Format exactly: "Focus Area: explanation"
+- Based on actual legislative pattern
 
-- generated_biography:
-  - 2 to 3 bullets
-  - Education, professional background, and public service
-  - No repetition of the same role
+key_bills
+- Array of 3 to 5 objects
+- Each object must contain:
+  - bill_number
+  - summary
+- One sentence each
+- Must prioritize substantive legislation when available
 
-- key_issues:
-  - 3 to 5 bullets
-  - Format: "Issue: short explanation"
-  - Focus on durable policy interests
-  - No ceremonial or awareness-based issues unless unavoidable
+political_positioning
+- One short label only
+- Format like:
+  "Center-right | Pro-business | Budget-focused"
+  "Center-left | Workforce-focused | Institutional"
 
-- district_development_signals:
-  - 2 to 4 bullets
-  - Must be grounded in clear legislative or infrastructure implications
-  - Avoid speculative phrases like "could signal"
-  - Keep practical and concrete
+political_positioning_bullets
+- Array of 2 to 3 bullets
+- Governing style and practical priorities
+- Do not restate party label
 
-- legislative_focus_areas:
-  - 3 to 5 bullets
-  - Format: "Focus Area: short explanation"
-  - Reflect actual legislative behavior patterns
-  - Prioritize policy over symbolic activity
+sbdc_framing
+- String, 2 to 3 short sentences max
+- Must be specific to this legislator
+- Explain what kind of business story, district outcome, funding argument, or ROI framing is most likely to resonate
 
-- key_bills:
-  - REQUIRED
-  - array of 3 to 5 items
-  - each item must include:
-    - bill_number
-    - summary
-  - choose the most representative and substantive bills
-  - one-sentence summaries only
-  - do not prioritize ceremonial resolutions if substantive bills are available
-  - this field must never be empty if bills are provided
+talking_points
+- Array of 4 to 5 bullets
+- Each bullet must be short, actionable, and specific to the legislator
 
-- political_positioning:
-  - Short label only
-  - Examples:
-    - "Center-right | Pro-business | Fiscal conservative"
-    - "Center-left | Workforce-focused | Institutional"
-  - Do NOT just restate party
+QUALITY FILTER:
+Before finalizing, remove:
+- repeated ideas
+- generic outreach language
+- ceremonial overemphasis
+- long explanations
+- broad statements not grounded in the inputs
 
-- political_positioning_bullets:
-  - 2 to 3 bullets MAX
-  - Explain governing style and priorities
-  - Be direct and specific
-
-- sbdc_framing:
-  - 2 to 3 short sentences
-  - Must be actionable and strategic
-  - Focus on alignment with:
-    - small business growth
-    - workforce
-    - economic development
-    - ROI / outcomes
-  - No fluff
-
-- talking_points:
-  - 4 to 5 bullets
-  - Each bullet must be:
-    - short
-    - actionable
-    - specific to the legislator
-  - Avoid generic statements
-
-QUALITY BAR:
-- The output should feel like a briefing memo, not an essay.
-- A reader should understand the legislator in seconds.
-- Prioritize clarity over completeness.
-- Strong signal > more words.
+Use only the metadata and bill list below. Do not invent facts.
 """.strip()
 
     payload = {
@@ -438,6 +405,63 @@ def call_gemini(client: genai.Client, prompt: str) -> Dict[str, Any]:
 
 
 # =========================
+# Cleanup helpers
+# =========================
+def clean_bullet_text(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip("•- ")
+    return text
+
+
+def clean_bullet_list(items: Any, max_items: int) -> List[str]:
+    if not isinstance(items, list):
+        return []
+
+    cleaned: List[str] = []
+    seen = set()
+
+    for item in items:
+        value = clean_bullet_text(str(item))
+        if not value:
+            continue
+
+        lowered = value.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+
+        cleaned.append(value)
+        if len(cleaned) >= max_items:
+            break
+
+    return cleaned
+
+
+def clean_summary_text(text: str, max_sentences: int = 2) -> str:
+    text = clean_bullet_text(text)
+    if not text:
+        return ""
+
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts:
+        return text
+
+    return " ".join(parts[:max_sentences])
+
+
+def split_into_short_sentences(text: str, max_sentences: int = 3) -> str:
+    text = clean_bullet_text(text)
+    if not text:
+        return ""
+
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    return " ".join(parts[:max_sentences])
+
+
+# =========================
 # Transform helpers
 # =========================
 def join_pipe(items: Any) -> str:
@@ -474,17 +498,19 @@ def normalize_key_bills(items: Any, fallback_bills: List[Dict[str, str]]) -> str
                 or ""
             ).strip()
 
+            summary = clean_summary_text(summary, max_sentences=1)
+
             if bill_number and summary:
                 out.append(f"{bill_number}::{summary}")
 
     if out:
-        return " || ".join(out)
+        return " || ".join(out[:5])
 
     fallback_out: List[str] = []
     for bill in fallback_bills[:5]:
         bill_number = bill.get("bill_number", "").strip()
-        bill_title = bill.get("bill_title", "").strip()
-        bill_summary = bill.get("bill_summary", "").strip()
+        bill_title = clean_bullet_text(bill.get("bill_title", "").strip())
+        bill_summary = clean_summary_text(bill.get("bill_summary", "").strip(), max_sentences=1)
 
         if bill_number and bill_summary:
             if bill_title:
@@ -500,17 +526,52 @@ def to_sheet_row(
     result: Dict[str, Any],
     bills: List[Dict[str, str]],
 ) -> List[str]:
-    committee_relevance_summary = str(result.get("committee_relevance_summary", "")).strip()
-    time_in_office_summary = join_pipe(result.get("time_in_office_summary", []))
-    generated_biography = join_pipe(result.get("generated_biography", []))
-    key_issues = join_pipe(result.get("key_issues", []))
-    district_development_signals = join_pipe(result.get("district_development_signals", []))
-    legislative_focus_areas = join_pipe(result.get("legislative_focus_areas", []))
-    key_bills = normalize_key_bills(result.get("key_bills", []), bills)
-    political_positioning = str(result.get("political_positioning", "")).strip()
-    political_positioning_bullets = join_pipe(result.get("political_positioning_bullets", []))
-    sbdc_framing = str(result.get("sbdc_framing", "")).strip()
-    talking_points = join_pipe(result.get("talking_points", []))
+    committee_relevance_summary = clean_summary_text(
+        str(result.get("committee_relevance_summary", "")).strip(),
+        max_sentences=2,
+    )
+
+    time_in_office_summary = join_pipe(
+        clean_bullet_list(result.get("time_in_office_summary", []), 3)
+    )
+
+    generated_biography = join_pipe(
+        clean_bullet_list(result.get("generated_biography", []), 3)
+    )
+
+    key_issues = join_pipe(
+        clean_bullet_list(result.get("key_issues", []), 5)
+    )
+
+    district_development_signals = join_pipe(
+        clean_bullet_list(result.get("district_development_signals", []), 4)
+    )
+
+    legislative_focus_areas = join_pipe(
+        clean_bullet_list(result.get("legislative_focus_areas", []), 5)
+    )
+
+    substantive_bills = [b for b in bills if bill_is_substantive(b.get("bill_number", ""))]
+    fallback_bills = substantive_bills if substantive_bills else bills
+    key_bills = normalize_key_bills(result.get("key_bills", []), fallback_bills)
+
+    political_positioning = clean_bullet_text(
+        str(result.get("political_positioning", "")).strip()
+    )
+
+    political_positioning_bullets = join_pipe(
+        clean_bullet_list(result.get("political_positioning_bullets", []), 3)
+    )
+
+    sbdc_framing = split_into_short_sentences(
+        str(result.get("sbdc_framing", "")).strip(),
+        max_sentences=3,
+    )
+
+    talking_points = join_pipe(
+        clean_bullet_list(result.get("talking_points", []), 5)
+    )
+
     bills_analyzed_count = str(len(bills))
     source_bill_numbers = " | ".join([b["bill_number"] for b in bills])
     last_updated = datetime.now(timezone.utc).isoformat()
