@@ -1,7 +1,7 @@
 import os
 import json
 import re
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -77,6 +77,94 @@ def slugify(name: str) -> str:
 def format_counties_full(counties: str) -> str:
     parts = [c.strip() for c in (counties or "").split("|") if c.strip()]
     return ", ".join(parts)
+
+
+def split_committees(text: str) -> List[str]:
+    return [x.strip() for x in (text or "").split("|") if x.strip()]
+
+
+def parse_year_from_date(date_text: str) -> int | None:
+    match = re.search(r"(\d{4})", date_text or "")
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def extract_previous_service_ranges(note: str) -> List[Tuple[int, int]]:
+    if not note:
+        return []
+
+    note_lower = note.lower()
+    ranges: List[Tuple[int, int]] = []
+
+    previous_section_match = re.search(r"previously served.*", note_lower)
+    if previous_section_match:
+        previous_text = previous_section_match.group(0)
+        for start, end in re.findall(r"(\d{4})\s*(?:-|–|to)\s*(\d{4})", previous_text):
+            start_year = int(start)
+            end_year = int(end)
+            if end_year >= start_year:
+                ranges.append((start_year, end_year))
+
+    return ranges
+
+
+def estimate_legislative_service_years(row: Dict[str, str]) -> int | None:
+    note = row.get("Time_In_Office_Note", "") or ""
+    current_term_start = row.get("Current_Term_Start", "") or ""
+    current_term_end = row.get("Current_Term_End", "") or ""
+
+    start_year = parse_year_from_date(current_term_start)
+    end_year = parse_year_from_date(current_term_end)
+
+    if not start_year or not end_year or end_year <= start_year:
+        return None
+
+    current_term_years = end_year - start_year
+
+    since_match = re.search(r"since\s+(?:jan\.?\s*1,\s*)?(\d{4})", note, flags=re.IGNORECASE)
+    if since_match and "previously served" not in note.lower():
+        since_year = int(since_match.group(1))
+        if end_year > since_year:
+            return end_year - since_year
+
+    total_years = current_term_years
+
+    for prior_start, prior_end in extract_previous_service_ranges(note):
+        total_years += (prior_end - prior_start + 1)
+
+    return total_years
+
+
+def build_term_limit_note(row: Dict[str, str]) -> str:
+    projected_years = estimate_legislative_service_years(row)
+    if projected_years is None:
+        return ""
+
+    remaining = 12 - projected_years
+
+    if remaining <= 0:
+        return (
+            f"Projected to reach Michigan's 12-year legislative service cap at the end of this term "
+            f"({projected_years} years total); another legislative run would likely not be available."
+        )
+
+    if remaining >= 4:
+        return (
+            f"Projected legislative service at the end of this term: {projected_years} years; "
+            f"still below Michigan's 12-year cap and eligible to seek another legislative term if desired."
+        )
+
+    if remaining >= 2:
+        return (
+            f"Projected legislative service at the end of this term: {projected_years} years; "
+            f"still below Michigan's 12-year cap, though future eligibility will depend on the next term sought."
+        )
+
+    return (
+        f"Projected legislative service at the end of this term: {projected_years} years; "
+        f"near Michigan's 12-year cap, so future eligibility would likely be limited."
+    )
 
 
 # =========================
@@ -219,6 +307,11 @@ def render_html(row: Dict[str, str]) -> str:
     else:
         location_line = counties
 
+    time_in_office_items = split_pipe(row["Time_In_Office_Summary"])
+    term_limit_note = build_term_limit_note(row)
+    if term_limit_note:
+        time_in_office_items.append(term_limit_note)
+
     return template.render(
         name=row["Legislator"],
         chamber=chamber_label,
@@ -227,8 +320,9 @@ def render_html(row: Dict[str, str]) -> str:
         party_color=get_party_color(row["Party"]),
         location_line=location_line,
         image_url=row["Image_URL"],
-        committee=row["Committee_Relevance_Summary"],
-        time_in_office=split_pipe(row["Time_In_Office_Summary"]),
+        committee_names=split_committees(row.get("Committee_Assignments", "")),
+        committee_summary=row["Committee_Relevance_Summary"],
+        time_in_office=time_in_office_items,
         bio=split_pipe(row["Generated_Biography"]),
         issues=split_pipe(row["Key_Issues"]),
         district_signals=split_pipe(row["District_Development_Signals"]),
