@@ -90,6 +90,17 @@ def parse_biography_items(text: str) -> List[Tuple[str, str]]:
     return items
 
 
+def parse_labeled_items(text: str) -> List[Tuple[str, str]]:
+    items = []
+    for raw in split_pipe(text):
+        if ":" in raw:
+            label, body = raw.split(":", 1)
+            items.append((label.strip(), body.strip()))
+        else:
+            items.append(("", raw.strip()))
+    return items
+
+
 def parse_committee_items(text: str) -> List[Tuple[str, str]]:
     items = []
     for raw in (text or "").split("||"):
@@ -112,11 +123,6 @@ def normalize_committee_name(name: str) -> str:
 
     value = re.sub(r"\bLEO\b", "Labor and Economic Opportunity", value)
     value = re.sub(r"\bEGLE\b", "Environment, Great Lakes, and Energy", value)
-
-    if "Appropriations" in value and "Subcommittee" not in value and value.lower() != "appropriations committee":
-        if "Committee" not in value:
-            if value.startswith("Appropriations "):
-                value = value.replace("Appropriations ", "Appropriations Subcommittee on ", 1)
 
     if value.startswith("Labor and Economic Opportunity Appropriations"):
         value = value.replace(
@@ -394,7 +400,7 @@ def render_html(row: Dict[str, str]) -> str:
         committee_items=committee_items,
         time_in_office=time_in_office_items,
         bio=parse_biography_items(row["Generated_Biography"]),
-        issues=split_pipe(row["Key_Issues"]),
+        issues=parse_labeled_items(row["Key_Issues"]),
         district_signals=split_pipe(row["District_Development_Signals"]),
         focus=split_pipe(row["Legislative_Focus_Areas"]),
         bills=split_key_bills(row["Key_Bills"]),
