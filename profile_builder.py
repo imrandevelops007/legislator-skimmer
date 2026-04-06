@@ -296,8 +296,15 @@ BILL INTERPRETATION RULES:
 - Ceremonial or recognition resolutions such as HR and SR should NOT define the legislator's core policy focus.
 - If only ceremonial items are available, include them only as weak supporting evidence.
 - If only ceremonial items are available, prioritize committee roles, prior government experience, professional background, and durable issue cues over the resolution topics themselves.
-- Do not let awareness days, commemorations, or honorary recognitions drive key issues, legislative focus, or political positioning unless there is no stronger evidence.
+- Do not let awareness days, commemorations, or honorary recognitions drive key issues, legislative focus, political positioning, or SBDC framing unless there is no stronger evidence.
 - When substantive bills exist, key_bills must primarily use those substantive bills.
+
+SECTION DIFFERENTIATION RULES:
+- Key Issues = durable, long-horizon policy priorities.
+- District Development Signals = district-facing economic, workforce, infrastructure, education, or local-government implications.
+- Legislative Focus = what the legislator is actively shaping now through committees, appropriations power, or current legislative activity.
+- These sections must not repeat the same idea in different wording.
+- Each section must add new information.
 
 COMMITTEE RELEVANCE RULES:
 - String, not array
@@ -311,11 +318,13 @@ TIME IN OFFICE RULES:
 - Array of 2 to 3 bullets
 - Timeline only
 - No commentary
+- Do not include term-limit analysis here
 
 BIOGRAPHY RULES:
 - Array of 2 to 3 bullets
 - Education, profession, public service
 - Tight and factual
+- Avoid restating issue areas already covered elsewhere
 
 KEY ISSUES RULES:
 - Array of 3 to 5 bullets
@@ -325,14 +334,17 @@ KEY ISSUES RULES:
 
 DISTRICT DEVELOPMENT SIGNALS RULES:
 - Array of 2 to 4 bullets
-- Concrete economic, workforce, infrastructure, agriculture, education, local government, or community-development implications only
+- Concrete district-facing implications only
+- Prioritize local business climate, workforce pipelines, infrastructure, education, agriculture, healthcare access, or local government capacity when supported
 - No speculative phrases like "could signal", "may suggest", or "appears to"
+- Do not simply restate the same themes used in Key Issues
 
 LEGISLATIVE FOCUS RULES:
 - Array of 3 to 5 bullets
 - Format exactly: "Focus Area: explanation"
-- Reflect actual policy orientation, not ceremonial recognition topics
-- If bill evidence is weak, rely more on committee and background signals
+- Tie this section to current committee power, budget authority, or present legislative activity
+- Make it more action-oriented than Key Issues
+- Do not simply restate district implications
 
 KEY BILLS RULES:
 - Array of 3 to 5 objects
@@ -369,6 +381,7 @@ SBDC FRAMING RULES:
   - education-to-workforce pathways
   - agriculture or supply chain resilience
   - efficient local service delivery
+  - budget stewardship and measurable return on investment
 - Avoid generic phrases that could fit almost anyone
 - Explain what kind of business story, district outcome, or ROI framing is most likely to resonate with this legislator
 
@@ -513,6 +526,57 @@ def normalize_sbdc_framing(text: str) -> str:
     return text.strip()
 
 
+def normalize_for_similarity(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"^[a-z\s/&-]+:\s*", "", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def token_set(text: str) -> set[str]:
+    stop_words = {
+        "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "with",
+        "through", "from", "by", "that", "this", "their", "state", "local",
+        "support", "supports", "focus", "focused", "area", "issues", "policy",
+        "policies", "development", "economic", "programs", "funding"
+    }
+    tokens = set(normalize_for_similarity(text).split())
+    return {t for t in tokens if t and t not in stop_words}
+
+
+def jaccard_similarity(a: str, b: str) -> float:
+    a_tokens = token_set(a)
+    b_tokens = token_set(b)
+
+    if not a_tokens or not b_tokens:
+        return 0.0
+
+    intersection = len(a_tokens & b_tokens)
+    union = len(a_tokens | b_tokens)
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def dedupe_against(reference_items: List[str], candidate_items: List[str], threshold: float = 0.72) -> List[str]:
+    kept: List[str] = []
+
+    for candidate in candidate_items:
+        is_duplicate = False
+
+        for reference in reference_items + kept:
+            if jaccard_similarity(candidate, reference) >= threshold:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            kept.append(candidate)
+
+    return kept
+
+
 # =========================
 # Transform helpers
 # =========================
@@ -523,14 +587,6 @@ def join_pipe(items: Any) -> str:
 
 
 def normalize_key_bills(items: Any, selected_bills: List[Dict[str, str]]) -> str:
-    """
-    Convert Gemini key_bills output into:
-    BILL_NUMBER::summary || BILL_NUMBER::summary
-
-    Fallback logic:
-    1. Prefer substantive selected bills
-    2. If none exist, allow ceremonial selected bills
-    """
     substantive_selected = [b for b in selected_bills if bill_is_substantive(b.get("bill_number", ""))]
     ceremonial_selected = [b for b in selected_bills if bill_is_ceremonial(b.get("bill_number", ""))]
 
@@ -560,7 +616,6 @@ def normalize_key_bills(items: Any, selected_bills: List[Dict[str, str]]) -> str
             if not bill_number or not summary:
                 continue
 
-            # If substantive selected bills exist, ignore ceremonial Gemini choices
             if substantive_selected and bill_is_ceremonial(bill_number):
                 continue
 
@@ -597,25 +652,20 @@ def to_sheet_row(
         str(result.get("committee_relevance_summary", "")).strip()
     )
 
-    time_in_office_summary = join_pipe(
-        clean_bullet_list(result.get("time_in_office_summary", []), 3)
-    )
+    time_in_office_items = clean_bullet_list(result.get("time_in_office_summary", []), 3)
+    generated_biography_items = clean_bullet_list(result.get("generated_biography", []), 3)
+    key_issues_items = clean_bullet_list(result.get("key_issues", []), 5)
+    district_signal_items = clean_bullet_list(result.get("district_development_signals", []), 4)
+    legislative_focus_items = clean_bullet_list(result.get("legislative_focus_areas", []), 5)
 
-    generated_biography = join_pipe(
-        clean_bullet_list(result.get("generated_biography", []), 3)
-    )
+    district_signal_items = dedupe_against(key_issues_items, district_signal_items, threshold=0.68)
+    legislative_focus_items = dedupe_against(key_issues_items + district_signal_items, legislative_focus_items, threshold=0.68)
 
-    key_issues = join_pipe(
-        clean_bullet_list(result.get("key_issues", []), 5)
-    )
+    if not district_signal_items:
+        district_signal_items = clean_bullet_list(result.get("district_development_signals", []), 2)
 
-    district_development_signals = join_pipe(
-        clean_bullet_list(result.get("district_development_signals", []), 4)
-    )
-
-    legislative_focus_areas = join_pipe(
-        clean_bullet_list(result.get("legislative_focus_areas", []), 5)
-    )
+    if not legislative_focus_items:
+        legislative_focus_items = clean_bullet_list(result.get("legislative_focus_areas", []), 2)
 
     key_bills = normalize_key_bills(result.get("key_bills", []), bills)
 
@@ -644,21 +694,21 @@ def to_sheet_row(
     return [
         legislator,                     # A
         committee_relevance_summary,   # B
-        time_in_office_summary,        # C
-        generated_biography,           # D
-        key_issues,                    # E
-        district_development_signals,  # F
-        legislative_focus_areas,       # G
-        key_bills,                     # H
-        political_positioning,         # I
-        political_positioning_bullets, # J
-        sbdc_framing,                  # K
-        talking_points,                # L
-        bills_analyzed_count,          # M
-        source_bill_numbers,           # N
-        last_updated,                  # O
-        profile_processed,             # P
-        notes,                         # Q
+        join_pipe(time_in_office_items),          # C
+        join_pipe(generated_biography_items),     # D
+        join_pipe(key_issues_items),              # E
+        join_pipe(district_signal_items),         # F
+        join_pipe(legislative_focus_items),       # G
+        key_bills,                                # H
+        political_positioning,                    # I
+        political_positioning_bullets,            # J
+        sbdc_framing,                             # K
+        talking_points,                           # L
+        bills_analyzed_count,                     # M
+        source_bill_numbers,                      # N
+        last_updated,                             # O
+        profile_processed,                        # P
+        notes,                                    # Q
     ]
 
 
