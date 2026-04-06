@@ -8,13 +8,13 @@
 
     @page {
       size: letter;
-      margin: 0.48in 0.54in;
+      margin: 0.5in 0.55in;
     }
 
     body {
       font-family: 'Roboto', Arial, sans-serif;
-      line-height: 1.22;
-      font-size: 11.8px;
+      line-height: 1.28;
+      font-size: 12pt;
       color: #111;
       margin: 0;
     }
@@ -22,7 +22,7 @@
     .report-header {
       position: relative;
       padding-bottom: 10px;
-      margin-bottom: 11px;
+      margin-bottom: 10px;
       border-bottom: 2.5px solid {{ party_color }};
       break-inside: avoid;
       page-break-inside: avoid;
@@ -38,7 +38,7 @@
     }
 
     .name {
-      font-size: 25px;
+      font-size: 24pt;
       font-weight: 900;
       color: {{ party_color }};
       line-height: 1.02;
@@ -46,39 +46,48 @@
     }
 
     .party {
-      font-size: 13.4px;
+      font-size: 12.5pt;
       font-weight: 700;
       margin-bottom: 1px;
     }
 
     .district {
-      font-size: 12.9px;
+      font-size: 12pt;
       font-weight: 500;
       margin-bottom: 1px;
     }
 
     .location {
-      font-size: 11.2px;
+      font-size: 10.8pt;
       color: #333;
-      line-height: 1.22;
+      line-height: 1.2;
     }
 
     .section {
-      margin-top: 9px;
+      margin-top: 7px;
       break-inside: avoid;
       page-break-inside: avoid;
     }
 
     .section-title {
-      font-size: 13.8px;
+      font-size: 13pt;
       font-weight: 700;
-      margin-bottom: 4px;
+      margin-bottom: 3px;
       break-after: avoid;
       page-break-after: avoid;
     }
 
+    .committee-names {
+      margin: 0 0 3px 0;
+      line-height: 1.24;
+    }
+
+    .committee-name {
+      font-weight: 700;
+    }
+
     .section-intro {
-      margin: 0 0 4px 0;
+      margin: 0 0 3px 0;
     }
 
     .bullet {
@@ -95,10 +104,6 @@
 
     p {
       margin: 0 0 3px 0;
-    }
-
-    .tight {
-      margin-top: 0;
     }
   </style>
 </head>
@@ -123,7 +128,16 @@
 
 <div class="section">
   <div class="section-title">Committee Relevance</div>
-  <p class="section-intro">{{ committee }}</p>
+
+  {% if committee_names %}
+  <p class="committee-names">
+    {% for item in committee_names %}
+      <span class="committee-name">{{ item }}</span>{% if not loop.last %} | {% endif %}
+    {% endfor %}
+  </p>
+  {% endif %}
+
+  <p class="section-intro">{{ committee_summary }}</p>
 </div>
 
 <div class="section">
