@@ -24,12 +24,12 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run main collector
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          python main.py
+#      - name: Run main collector
+#        env:
+#          SHEET_ID: ${{ secrets.SHEET_ID }}
+#          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+#        run: |
+#          python main.py
 
 #      - name: Run analyzer
 #        env:
