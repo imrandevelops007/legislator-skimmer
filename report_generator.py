@@ -79,8 +79,74 @@ def format_counties_full(counties: str) -> str:
     return ", ".join(parts)
 
 
-def split_committees(text: str) -> List[str]:
-    return [x.strip() for x in (text or "").split("|") if x.strip()]
+def parse_biography_items(text: str) -> List[Tuple[str, str]]:
+    items = []
+    for raw in split_pipe(text):
+        if ":" in raw:
+            label, body = raw.split(":", 1)
+            items.append((label.strip(), body.strip()))
+        else:
+            items.append(("", raw.strip()))
+    return items
+
+
+def parse_committee_items(text: str) -> List[Tuple[str, str]]:
+    items = []
+    for raw in (text or "").split("||"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if "::" in raw:
+            committee, relevance = raw.split("::", 1)
+            items.append((committee.strip(), relevance.strip()))
+        else:
+            items.append((raw.strip(), ""))
+    return items
+
+
+def normalize_committee_name(name: str) -> str:
+    value = (name or "").strip()
+
+    if value.lower() == "appropriations":
+        return "Appropriations Committee"
+
+    value = re.sub(r"\bLEO\b", "Labor and Economic Opportunity", value)
+    value = re.sub(r"\bEGLE\b", "Environment, Great Lakes, and Energy", value)
+
+    if "Appropriations" in value and "Subcommittee" not in value and value.lower() != "appropriations committee":
+        if "Committee" not in value:
+            if value.startswith("Appropriations "):
+                value = value.replace("Appropriations ", "Appropriations Subcommittee on ", 1)
+
+    if value.startswith("Labor and Economic Opportunity Appropriations"):
+        value = value.replace(
+            "Labor and Economic Opportunity Appropriations",
+            "Appropriations Subcommittee on Labor and Economic Opportunity",
+            1,
+        )
+
+    if value.startswith("LEO Appropriations"):
+        value = value.replace(
+            "LEO Appropriations",
+            "Appropriations Subcommittee on Labor and Economic Opportunity",
+            1,
+        )
+
+    if value.startswith("School Aid"):
+        value = value.replace(
+            "School Aid",
+            "Appropriations Subcommittee on School Aid and Department of Education",
+            1,
+        )
+
+    if value.startswith("Higher Education"):
+        value = value.replace(
+            "Higher Education",
+            "Appropriations Subcommittee on Higher Education and Community Colleges",
+            1,
+        )
+
+    return value
 
 
 def parse_year_from_date(date_text: str) -> int | None:
@@ -152,7 +218,7 @@ def build_term_limit_note(row: Dict[str, str]) -> str:
     if remaining >= 4:
         return (
             f"Projected legislative service at the end of this term: {projected_years} years; "
-            f"still below Michigan's 12-year cap and eligible to seek another legislative term if desired."
+            f"still below Michigan's 12-year cap and eligible to seek another legislative term."
         )
 
     if remaining >= 2:
@@ -312,6 +378,11 @@ def render_html(row: Dict[str, str]) -> str:
     if term_limit_note:
         time_in_office_items.append(term_limit_note)
 
+    committee_items = [
+        (normalize_committee_name(name), note)
+        for name, note in parse_committee_items(row["Committee_Relevance_Summary"])
+    ]
+
     return template.render(
         name=row["Legislator"],
         chamber=chamber_label,
@@ -320,10 +391,9 @@ def render_html(row: Dict[str, str]) -> str:
         party_color=get_party_color(row["Party"]),
         location_line=location_line,
         image_url=row["Image_URL"],
-        committee_names=split_committees(row.get("Committee_Assignments", "")),
-        committee_summary=row["Committee_Relevance_Summary"],
+        committee_items=committee_items,
         time_in_office=time_in_office_items,
-        bio=split_pipe(row["Generated_Biography"]),
+        bio=parse_biography_items(row["Generated_Biography"]),
         issues=split_pipe(row["Key_Issues"]),
         district_signals=split_pipe(row["District_Development_Signals"]),
         focus=split_pipe(row["Legislative_Focus_Areas"]),
