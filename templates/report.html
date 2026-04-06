@@ -8,98 +8,130 @@
 
     @page {
       size: letter;
-      margin: 0.5in 0.55in;
+      margin: 0.44in 0.5in;
     }
 
     body {
       font-family: 'Roboto', Arial, sans-serif;
-      line-height: 1.28;
-      font-size: 12pt;
+      line-height: 1.2;
+      font-size: 11.1px;
       color: #111;
       margin: 0;
     }
 
     .report-header {
       position: relative;
-      padding-bottom: 10px;
+      padding: 0 118px 8px 0;
       margin-bottom: 10px;
-      border-bottom: 2.5px solid {{ party_color }};
+      border-bottom: 2.2px solid {{ party_color }};
       break-inside: avoid;
       page-break-inside: avoid;
+      min-height: 106px;
+    }
+
+    .photo-wrap {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 100px;
+      height: 100px;
+      overflow: hidden;
+      border-radius: 6px;
+      background: #f3f3f3;
     }
 
     .photo {
-      float: right;
-      width: 102px;
-      height: auto;
-      border-radius: 4px;
-      margin-left: 16px;
+      width: 100%;
+      height: 100%;
       object-fit: cover;
+      display: block;
     }
 
     .name {
-      font-size: 24pt;
+      font-size: 24px;
       font-weight: 900;
       color: {{ party_color }};
-      line-height: 1.02;
-      margin-bottom: 2px;
+      line-height: 1.0;
+      margin-bottom: 3px;
     }
 
     .party {
-      font-size: 12.5pt;
+      font-size: 13px;
       font-weight: 700;
-      margin-bottom: 1px;
+      margin-bottom: 2px;
     }
 
     .district {
-      font-size: 12pt;
+      font-size: 12px;
       font-weight: 500;
-      margin-bottom: 1px;
+      margin-bottom: 2px;
     }
 
     .location {
-      font-size: 10.8pt;
+      font-size: 10.6px;
       color: #333;
-      line-height: 1.2;
+      line-height: 1.25;
     }
 
     .section {
-      margin-top: 7px;
+      margin-top: 8px;
       break-inside: avoid;
       page-break-inside: avoid;
     }
 
     .section-title {
-      font-size: 13pt;
-      font-weight: 700;
-      margin-bottom: 3px;
+      font-size: 12.8px;
+      font-weight: 800;
+      margin-bottom: 4px;
       break-after: avoid;
       page-break-after: avoid;
     }
 
-    .committee-names {
-      margin: 0 0 3px 0;
-      line-height: 1.24;
+    .committee-list {
+      margin: 0;
+    }
+
+    .committee-item {
+      margin: 0 0 3px 18px;
+      text-indent: -8px;
+      padding-left: 8px;
+      line-height: 1.22;
     }
 
     .committee-name {
       font-weight: 700;
     }
 
-    .section-intro {
-      margin: 0 0 3px 0;
-    }
-
     .bullet {
-      margin-left: 12px;
-      margin-bottom: 2px;
+      margin: 0 0 3px 18px;
+      text-indent: -8px;
+      padding-left: 8px;
+      line-height: 1.22;
       break-inside: avoid;
       page-break-inside: avoid;
     }
 
+    .bio-bullet {
+      margin: 0 0 3px 18px;
+      text-indent: -8px;
+      padding-left: 8px;
+      line-height: 1.22;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+
+    .bio-label {
+      font-weight: 700;
+    }
+
     .positioning-line {
       font-weight: 700;
-      margin-bottom: 3px;
+      margin: 0 0 3px 0;
+    }
+
+    .section-intro {
+      margin: 0 0 2px 0;
+      line-height: 1.22;
     }
 
     p {
@@ -111,7 +143,9 @@
 <body>
 
 <div class="report-header">
-  <img class="photo" src="{{ image_url }}">
+  <div class="photo-wrap">
+    <img class="photo" src="{{ image_url }}">
+  </div>
 
   <div class="name">{{ name }}</div>
 
@@ -128,16 +162,11 @@
 
 <div class="section">
   <div class="section-title">Committee Relevance</div>
-
-  {% if committee_names %}
-  <p class="committee-names">
-    {% for item in committee_names %}
-      <span class="committee-name">{{ item }}</span>{% if not loop.last %} | {% endif %}
+  <div class="committee-list">
+    {% for committee, note in committee_items %}
+    <div class="committee-item">• <span class="committee-name">{{ committee }}</span>{% if note %}: {{ note }}{% endif %}</div>
     {% endfor %}
-  </p>
-  {% endif %}
-
-  <p class="section-intro">{{ committee_summary }}</p>
+  </div>
 </div>
 
 <div class="section">
@@ -149,8 +178,8 @@
 
 <div class="section">
   <div class="section-title">Biography</div>
-  {% for item in bio %}
-  <div class="bullet">• {{ item }}</div>
+  {% for label, body in bio %}
+  <div class="bio-bullet">• {% if label %}<span class="bio-label">{{ label }}:</span> {% endif %}{{ body }}</div>
   {% endfor %}
 </div>
 
