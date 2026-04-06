@@ -369,12 +369,56 @@ POLITICAL POSITIONING BULLETS RULES:
 SBDC FRAMING RULES:
 - String, 2 to 3 short sentences max
 - Must be specific to this legislator
-- Tie it to the strongest concrete signals in the input
-- Avoid generic language that could fit almost anyone
+
+- Clearly answer:
+  "What aspect of SBDC is most relevant to this legislator?"
+
+- Anchor to:
+  - committees
+  - legislative activity
+  - district needs
+
+- Focus on:
+  - economic impact
+  - workforce outcomes
+  - business growth
+  - return on investment
+
+- Avoid generic descriptions of SBDC
+- Avoid phrases that could apply to any legislator
 
 TALKING POINTS RULES:
 - Array of 4 to 5 bullets
-- Each bullet must be short, specific, and usable in outreach prep
+- These are NOT scripts or sentences to say
+- These are brief strategic topics to guide conversation
+
+- Each bullet should:
+  - connect the legislator’s priorities to SBDC work
+  - highlight a relevant angle for engagement
+  - suggest what kind of outcome, story, or impact would resonate
+
+- Focus on:
+  - how SBDC supports their district priorities
+  - what types of businesses or outcomes align with their interests
+  - where SBDC provides measurable value (jobs, growth, capital access, etc.)
+
+- Keep bullets short (1 line preferred)
+
+GOOD EXAMPLES:
+- Workforce pipeline support through small business development
+- Rural entrepreneurship and local economic stability
+- ROI of state-supported business services
+- Small business retention and expansion in district communities
+- Connecting technical assistance to job creation outcomes
+
+BAD EXAMPLES:
+- "Discuss SBDC services with the legislator"
+- "Explain what SBDC does"
+- Generic outreach phrasing with no connection to the legislator
+
+- Do not repeat SBDC framing language verbatim
+- Do not write full conversational sentences
+- Do not be generic
 
 QUALITY FILTER:
 Before finalizing, remove:
