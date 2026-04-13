@@ -66,5 +66,10 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           DRIVE_REPORTS_FOLDER_ID: ${{ secrets.DRIVE_REPORTS_FOLDER_ID }}
+      
+          TEMPLATE_DIR: templates
+          REPORT_TEMPLATE: report.html
+      
           OVERWRITE_EXISTING_IN_TARGET_FOLDER: "true"
+          ONLY_LEGISLATOR: "John Fitzgerald"
         run: python report_generator.py
