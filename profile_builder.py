@@ -1,10 +1,8 @@
 import os
+import re
 import json
 import time
-import random
-import re
-from datetime import datetime, timezone
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -14,454 +12,449 @@ from google import genai
 # =========================
 # Config
 # =========================
+
 SHEET_ID = os.environ["SHEET_ID"]
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
+
+MAX_BILLS_PER_LEGISLATOR = int(os.getenv("MAX_BILLS_PER_LEGISLATOR", "8"))
+MIN_SUBSTANTIVE_BILLS_REQUIRED = int(os.getenv("MIN_SUBSTANTIVE_BILLS_REQUIRED", "4"))
+
+PROFILE_MAX_RETRIES = int(os.getenv("PROFILE_MAX_RETRIES", "2"))
+PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "4"))
+
+STOP_ON_QUOTA_EXHAUSTION = os.getenv("STOP_ON_QUOTA_EXHAUSTION", "true").strip().lower() == "true"
+
+# If true, skip rebuilding a legislator whose profile row is already processed
+SKIP_ALREADY_PROCESSED_PROFILES = os.getenv("SKIP_ALREADY_PROCESSED_PROFILES", "false").strip().lower() == "true"
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+TAB_ACTIVITY = os.getenv("TAB_ACTIVITY", "Activity_Items")
+TAB_METADATA = os.getenv("TAB_METADATA", "Legislator_Metadata")
+TAB_PROFILES = os.getenv("TAB_PROFILES", "Profiles_Dynamic")
 
-MAX_BILLS_PER_LEGISLATOR = int(os.getenv("MAX_BILLS_PER_LEGISLATOR", "12"))
-PROFILE_MAX_RETRIES = int(os.getenv("PROFILE_MAX_RETRIES", "5"))
-PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "3"))
-ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
-MIN_BILLS_REQUIRED = int(os.getenv("MIN_BILLS_REQUIRED", "3"))
-
-METADATA_RANGE = "Legislator_Metadata!A2:P"
-ACTIVITY_RANGE = "Activity_Items!A2:I"
-PROFILES_RANGE = "Profiles_Dynamic!A2:Q"
-
-# Legislator_Metadata columns:
-# A  Legislator
-# B  Chamber
-# C  District
-# D  Party
-# E  First_Elected_to_Current_Chamber
-# F  Current_Term_Start
-# G  Current_Term_End
-# H  Time_In_Office_Note
-# I  Education
-# J  Professional_Background
-# K  Government_Experience
-# L  Committee_Assignments
-# M  Key_Issues_Source
-# N  Political_Positioning_Source
-# O  Verification_Notes
-# P  Image_URL
-
-# Profiles_Dynamic columns:
-# A  Legislator
-# B  Committee_Relevance_Summary
-# C  Time_In_Office_Summary
-# D  Generated_Biography
-# E  Key_Issues
-# F  District_Development_Signals
-# G  Legislative_Focus_Areas
-# H  Key_Bills
-# I  Political_Positioning
-# J  Political_Positioning_Bullets
-# K  SBDC_Framing
-# L  Talking_Points
-# M  Bills_Analyzed_Count
-# N  Source_Bill_Numbers
-# O  Last_Updated
-# P  Profile_Processed
-# Q  Notes
-
+# Required output fields in Profiles_Dynamic
+PROFILE_FIELDS = [
+    "Committee relevance",
+    "Time in office summary",
+    "Biography",
+    "Key issues",
+    "District signals",
+    "Legislative focus",
+    "Key bills",
+    "Political positioning",
+    "SBDC framing",
+    "Talking points",
+    "Bill count + sources",
+    "Processed",
+]
 
 # =========================
-# Sheets helpers
+# Helpers
 # =========================
-def get_sheets_service():
-    info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds)
+
+def normalize_header(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_")
 
 
-def sheets_get_values(service, rng: str) -> List[List[str]]:
+def clean(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def bool_from_cell(value: Any) -> bool:
+    return clean(value).lower() in {"true", "yes", "1", "y"}
+
+
+def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def looks_like_quota_error(text: str) -> bool:
+    t = clean(text).lower()
     return (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=SHEET_ID, range=rng)
-        .execute()
-        .get("values", [])
+        "resource_exhausted" in t
+        or "quota exceeded" in t
+        or "429" in t
+        or "generate_content_free_tier_requests" in t
     )
 
 
-def sheets_update_range(service, rng: str, values: List[List[str]]) -> None:
-    service.spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": values},
-    ).execute()
+def looks_like_error_output(text: str) -> bool:
+    t = clean(text).lower()
+    return (
+        t.startswith("error:")
+        or "resource_exhausted" in t
+        or "quota exceeded" in t
+        or "429" in t
+        or "traceback" in t
+        or "exception" in t
+    )
 
 
-def sheets_append_rows(service, rng: str, values: List[List[str]]) -> None:
-    service.spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": values},
-    ).execute()
+def parse_json_response(text: str) -> Dict[str, Any]:
+    text = clean(text)
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text.strip()).strip()
+
+    return json.loads(text)
 
 
-def pad_row(row: List[str], target_len: int) -> List[str]:
-    return row + [""] * (target_len - len(row))
+def get_service_account_credentials() -> Credentials:
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    return Credentials.from_service_account_info(info, scopes=SCOPES)
 
 
-# =========================
-# Load data
-# =========================
-def load_metadata(service) -> Dict[str, Dict[str, str]]:
-    rows = sheets_get_values(service, METADATA_RANGE)
-    out: Dict[str, Dict[str, str]] = {}
-
-    for row in rows:
-        row = pad_row(row, 16)
-        legislator = row[0].strip()
-        if not legislator:
-            continue
-
-        out[legislator] = {
-            "legislator": legislator,
-            "chamber": row[1].strip(),
-            "district": row[2].strip(),
-            "party": row[3].strip(),
-            "first_elected_to_current_chamber": row[4].strip(),
-            "current_term_start": row[5].strip(),
-            "current_term_end": row[6].strip(),
-            "time_in_office_note": row[7].strip(),
-            "education": row[8].strip(),
-            "professional_background": row[9].strip(),
-            "government_experience": row[10].strip(),
-            "committee_assignments": row[11].strip(),
-            "key_issues_source": row[12].strip(),
-            "political_positioning_source": row[13].strip(),
-            "verification_notes": row[14].strip(),
-            "image_url": row[15].strip(),
-        }
-
-    return out
+def get_sheets_service():
+    creds = get_service_account_credentials()
+    return build("sheets", "v4", credentials=creds)
 
 
-def load_activity(service) -> Dict[str, List[Dict[str, str]]]:
-    rows = sheets_get_values(service, ACTIVITY_RANGE)
-    out: Dict[str, List[Dict[str, str]]] = {}
-
-    for row in rows:
-        row = pad_row(row, 9)
-        url, legislator, item_type, timestamp, bill_number, bill_title, bill_summary, processed, notes = row
-
-        legislator = legislator.strip()
-        if not legislator:
-            continue
-        if item_type.strip().lower() != "bill":
-            continue
-        if processed.strip().upper() != "TRUE":
-            continue
-        if not bill_number.strip() or not bill_summary.strip():
-            continue
-
-        out.setdefault(legislator, []).append(
-            {
-                "url": url.strip(),
-                "timestamp": timestamp.strip(),
-                "bill_number": bill_number.strip(),
-                "bill_title": bill_title.strip(),
-                "bill_summary": bill_summary.strip(),
-                "notes": notes.strip(),
-            }
-        )
-
-    for legislator in out:
-        out[legislator].sort(key=lambda x: x["timestamp"], reverse=True)
-
-    return out
-
-
-def load_existing_profiles(service) -> Dict[str, int]:
-    rows = sheets_get_values(service, PROFILES_RANGE)
-    out: Dict[str, int] = {}
-
-    for idx, row in enumerate(rows, start=2):
-        row = pad_row(row, 17)
-        legislator = row[0].strip()
-        if legislator:
-            out[legislator] = idx
-
-    return out
-
-
-# =========================
-# Bill prioritization
-# =========================
-def classify_bill_priority(bill_number: str) -> int:
-    bill_number = (bill_number or "").upper().strip()
-
-    if re.match(r"^(HB|SB)\s+\d+$", bill_number):
-        return 1
-
-    if re.match(r"^(HCR|SCR)\s+\d+$", bill_number):
-        return 2
-
-    if re.match(r"^(HR|SR)\s+\d+$", bill_number):
-        return 3
-
-    return 4
-
-
-def bill_is_substantive(bill_number: str) -> bool:
-    bill_number = (bill_number or "").upper().strip()
-    return bool(re.match(r"^(HB|SB|HCR|SCR)\s+\d+$", bill_number))
-
-
-def bill_is_ceremonial(bill_number: str) -> bool:
-    bill_number = (bill_number or "").upper().strip()
-    return bool(re.match(r"^(HR|SR)\s+\d+$", bill_number))
-
-
-def select_best_bills(bills: List[Dict[str, str]], max_bills: int) -> List[Dict[str, str]]:
-    buckets: Dict[int, List[Dict[str, str]]] = {1: [], 2: [], 3: [], 4: []}
-
-    for bill in bills:
-        priority = classify_bill_priority(bill["bill_number"])
-        buckets[priority].append(bill)
-
-    selected: List[Dict[str, str]] = []
-
-    for priority in [1, 2, 3, 4]:
-        for bill in buckets[priority]:
-            if len(selected) >= max_bills:
-                break
-            selected.append(bill)
-        if len(selected) >= max_bills:
-            break
-
-    return selected
-
-
-# =========================
-# Gemini helpers
-# =========================
-def build_client() -> genai.Client:
-    if not GEMINI_API_KEY.strip():
-        raise RuntimeError("GEMINI_API_KEY is missing.")
+def get_gemini_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def backoff_sleep(attempt: int):
-    base = min(60, 5 * (2 ** (attempt - 1)))
-    jitter = random.uniform(0, 1.5)
-    wait_s = base + jitter
-    print(f"Retrying after {wait_s:.1f}s...")
-    time.sleep(wait_s)
+# =========================
+# Sheets I/O
+# =========================
+
+def get_sheet_values(service, tab_name: str) -> List[List[str]]:
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=tab_name,
+    ).execute()
+    return resp.get("values", [])
 
 
-def build_prompt(metadata: Dict[str, str], bills: List[Dict[str, str]]) -> str:
-    substantive_bills = [b for b in bills if bill_is_substantive(b.get("bill_number", ""))]
-    ceremonial_bills = [b for b in bills if bill_is_ceremonial(b.get("bill_number", ""))]
+def rows_as_dicts_with_headers(service, tab_name: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+    values = get_sheet_values(service, tab_name)
+    if not values:
+        return [], []
 
-    instructions = """
-You are a nonpartisan policy analyst creating a clean, highly skimmable legislator briefing for Michigan SBDC.
+    raw_headers = values[0]
+    norm_headers = [normalize_header(h) for h in raw_headers]
+    rows: List[Dict[str, Any]] = []
 
-Return ONLY valid JSON with exactly these keys:
-- committee_relevance_summary
-- time_in_office_summary
-- generated_biography
-- key_issues
-- district_development_signals
-- legislative_focus_areas
-- key_bills
-- political_positioning
-- political_positioning_bullets
-- sbdc_framing
-- talking_points
+    for row_num, row in enumerate(values[1:], start=2):
+        padded = row + [""] * (len(raw_headers) - len(row))
+        item = {norm_headers[i]: padded[i] for i in range(len(raw_headers))}
+        item["_row_number"] = row_num
+        rows.append(item)
 
-PRIMARY GOAL:
-Create a report that can be skimmed quickly by leadership.
+    return raw_headers, rows
 
-STYLE RULES:
-- Output JSON only.
-- Be concise.
-- Avoid filler.
-- Avoid repetition across sections.
-- Strong signal matters more than exhaustive coverage.
-- Keep phrasing clean and direct.
-- Do not use markdown.
 
-BILL INTERPRETATION RULES:
-- Substantive legislation should carry much more weight than ceremonial resolutions.
-- Ceremonial or recognition resolutions such as HR and SR should NOT define the legislator's core policy focus.
-- If only ceremonial items are available, use them as weak supporting evidence.
-- If only ceremonial items are available, rely more on committee roles, professional background, and government experience.
-- Do not let ceremonial items dominate key issues, legislative focus, political positioning, or SBDC framing.
-- When substantive bills exist, key_bills must primarily use those substantive bills.
+def column_letter_from_index(index_1_based: int) -> str:
+    result = ""
+    while index_1_based > 0:
+        index_1_based, rem = divmod(index_1_based - 1, 26)
+        result = chr(65 + rem) + result
+    return result
 
-SECTION DIFFERENTIATION RULES:
-- Key Issues = durable policy interests
-- District Development Signals = district-facing implications
-- Legislative Focus = what the legislator is actively shaping now through current power, committees, appropriations, or recent activity
-- These sections must not repeat the same idea in different wording
 
-COMMITTEE RELEVANCE RULES:
-- Return an array of 2 to 4 objects
-- Each object must contain:
-  - committee
-  - relevance
-- The committee field should be the committee or leadership title exactly or nearly exactly as provided
-- The relevance field must be one short sentence fragment or short sentence
-- Prioritize the highest-signal committees or leadership roles
-- Do not return one large paragraph
-- Focus on practical relevance to funding, regulation, education, workforce, infrastructure, healthcare, agriculture, or business climate
+def make_header_index(raw_headers: List[str]) -> Dict[str, int]:
+    return {normalize_header(h): i + 1 for i, h in enumerate(raw_headers)}
 
-TIME IN OFFICE RULES:
-- Array of 2 to 3 bullets
-- Timeline only
-- No commentary
 
-BIOGRAPHY RULES:
-- Array of exactly 2 to 3 bullets
-- Each bullet must begin with one of these labels:
-  - Education:
-  - Professional Experience:
-  - Public Service:
-- Use those exact labels
-- Keep each bullet short and factual
+def ensure_profiles_headers(service) -> Tuple[List[str], Dict[str, int]]:
+    raw_headers, rows = rows_as_dicts_with_headers(service, TAB_PROFILES)
 
-KEY ISSUES RULES:
-- Array of 3 to 5 bullets
-- Format exactly: "Issue: explanation"
-- Durable policy interests only
+    if not raw_headers:
+        initial_headers = ["Legislator"] + PROFILE_FIELDS
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"{TAB_PROFILES}!A1",
+            valueInputOption="RAW",
+            body={"values": [initial_headers]},
+        ).execute()
+        raw_headers = initial_headers
 
-DISTRICT DEVELOPMENT SIGNALS RULES:
-- Array of 2 to 4 bullets
-- Concrete district-facing implications only
-- No speculation
-- Do not just restate key issues
+    existing_norm = [normalize_header(h) for h in raw_headers]
+    missing = []
 
-LEGISLATIVE FOCUS RULES:
-- Array of 3 to 5 bullets
-- Do NOT start bullets with "Focus Area:"
-- Make bullets action-oriented
-- Tie them to current committee or legislative power
+    for required in ["Legislator"] + PROFILE_FIELDS:
+        if normalize_header(required) not in existing_norm:
+            missing.append(required)
 
-KEY BILLS RULES:
-- Array of 3 to 5 objects
-- Each object must contain:
-  - bill_number
-  - summary
-- One sentence each
-- Prefer HB/SB, then HCR/SCR
-- HR/SR should only appear when substantive bills are unavailable
-- Keep ceremonial summaries factual and brief
+    if missing:
+        updated_headers = raw_headers + missing
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"{TAB_PROFILES}!A1",
+            valueInputOption="RAW",
+            body={"values": [updated_headers]},
+        ).execute()
+        raw_headers = updated_headers
 
-POLITICAL POSITIONING RULES:
-- One short label only
-- Format like:
-  "Center-right | Pro-business | Budget-focused"
-  "Center-left | Workforce-focused | Institutional"
+    return raw_headers, make_header_index(raw_headers)
 
-POLITICAL POSITIONING BULLETS RULES:
-- Array of 2 to 3 bullets
-- Focus on governing style and practical priorities
 
-SBDC FRAMING RULES:
-- String, 2 to 3 short sentences max
-- Must be specific to this legislator
+def find_profile_row(rows: List[Dict[str, Any]], legislator: str) -> Optional[Dict[str, Any]]:
+    target = clean(legislator).lower()
+    for row in rows:
+        if clean(row.get("legislator")).lower() == target:
+            return row
+    return None
 
-- Clearly answer:
-  "What aspect of SBDC is most relevant to this legislator?"
 
-- Anchor to:
-  - committees
-  - legislative activity
-  - district needs
+def append_new_profile_row(service, legislator: str) -> int:
+    service.spreadsheets().values().append(
+        spreadsheetId=SHEET_ID,
+        range=f"{TAB_PROFILES}!A:A",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[legislator]]},
+    ).execute()
 
-- Focus on:
-  - economic impact
-  - workforce outcomes
-  - business growth
-  - return on investment
+    _, rows = rows_as_dicts_with_headers(service, TAB_PROFILES)
+    row = find_profile_row(rows, legislator)
+    if not row:
+        raise RuntimeError(f"Failed to append new profile row for {legislator}")
+    return int(row["_row_number"])
 
-- Avoid generic descriptions of SBDC
-- Avoid phrases that could apply to any legislator
 
-TALKING POINTS RULES:
-- Array of 4 to 5 bullets
-- These are NOT scripts or sentences to say
-- These are brief strategic topics to guide conversation
+def batch_update_profile_row(
+    service,
+    row_number: int,
+    header_index: Dict[str, int],
+    values_by_header: Dict[str, str],
+) -> None:
+    data = []
 
-- Each bullet should:
-  - connect the legislator’s priorities to SBDC work
-  - highlight a relevant angle for engagement
-  - suggest what kind of outcome, story, or impact would resonate
+    for header_name, value in values_by_header.items():
+        norm = normalize_header(header_name)
+        if norm not in header_index:
+            continue
 
-- Focus on:
-  - how SBDC supports their district priorities
-  - what types of businesses or outcomes align with their interests
-  - where SBDC provides measurable value (jobs, growth, capital access, etc.)
+        col_letter = column_letter_from_index(header_index[norm])
+        data.append({
+            "range": f"{TAB_PROFILES}!{col_letter}{row_number}",
+            "values": [[value]],
+        })
 
-- Keep bullets short (1 line preferred)
+    if not data:
+        return
 
-GOOD EXAMPLES:
-- Workforce pipeline support through small business development
-- Rural entrepreneurship and local economic stability
-- ROI of state-supported business services
-- Small business retention and expansion in district communities
-- Connecting technical assistance to job creation outcomes
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=SHEET_ID,
+        body={
+            "valueInputOption": "RAW",
+            "data": data,
+        },
+    ).execute()
 
-BAD EXAMPLES:
-- "Discuss SBDC services with the legislator"
-- "Explain what SBDC does"
-- Generic outreach phrasing with no connection to the legislator
 
-- Do not repeat SBDC framing language verbatim
-- Do not write full conversational sentences
-- Do not be generic
+# =========================
+# Data Selection
+# =========================
 
-QUALITY FILTER:
-Before finalizing, remove:
-- repeated ideas
-- generic outreach language
-- ceremonial overemphasis
-- long explanations
+def is_substantive_bill_number(bill_number: str) -> bool:
+    bill_number = clean(bill_number).upper()
+    return bill_number.startswith("HB") or bill_number.startswith("SB")
 
-Use only the metadata and bill list below. Do not invent facts.
+
+def score_bill(row: Dict[str, Any]) -> int:
+    bill_number = clean(row.get("bill_number"))
+    title = clean(row.get("bill_title")).lower()
+    summary = clean(row.get("bill_summary")).lower()
+
+    score = 0
+
+    if is_substantive_bill_number(bill_number):
+        score += 100
+    elif bill_number.startswith("HR") or bill_number.startswith("SR"):
+        score -= 50
+
+    noisy_terms = [
+        "tribute",
+        "memorial",
+        "commemorate",
+        "recognize",
+        "resolution of tribute",
+        "congratulating",
+        "honoring",
+    ]
+    if any(term in title or term in summary for term in noisy_terms):
+        score -= 40
+
+    if summary:
+        score += 20
+
+    if title:
+        score += 10
+
+    return score
+
+
+def get_legislator_activity(rows: List[Dict[str, Any]], legislator: str) -> List[Dict[str, Any]]:
+    target = clean(legislator).lower()
+    filtered = [r for r in rows if clean(r.get("legislator")).lower() == target]
+
+    enriched = [
+        r for r in filtered
+        if clean(r.get("bill_title")) and clean(r.get("bill_summary"))
+    ]
+
+    enriched.sort(key=score_bill, reverse=True)
+    return enriched
+
+
+def select_best_bills(rows: List[Dict[str, Any]], max_count: int) -> List[Dict[str, Any]]:
+    substantive = [r for r in rows if is_substantive_bill_number(r.get("bill_number", ""))]
+    non_substantive = [r for r in rows if not is_substantive_bill_number(r.get("bill_number", ""))]
+
+    selected = substantive[:max_count]
+    if len(selected) < max_count:
+        selected.extend(non_substantive[: max_count - len(selected)])
+
+    return selected[:max_count]
+
+
+# =========================
+# Prompting
+# =========================
+
+def build_legislator_prompt(metadata: Dict[str, Any], bills: List[Dict[str, Any]]) -> str:
+    legislator = clean(metadata.get("legislator"))
+    chamber = clean(metadata.get("chamber"))
+    district = clean(metadata.get("district"))
+    party = clean(metadata.get("party"))
+    term_dates = clean(metadata.get("term_dates"))
+    time_in_office_notes = clean(metadata.get("time_in_office_notes"))
+    education = clean(metadata.get("education"))
+    professional_background = clean(metadata.get("professional_background"))
+    government_experience = clean(metadata.get("government_experience"))
+    committee_assignments = clean(metadata.get("committee_assignments"))
+    counties = clean(metadata.get("counties"))
+    sources = clean(metadata.get("sources_and_verification_notes") or metadata.get("sources"))
+
+    bill_lines = []
+    for idx, bill in enumerate(bills, start=1):
+        bill_lines.append(
+            f"""Bill {idx}
+Bill Number: {clean(bill.get("bill_number"))}
+Bill Title: {clean(bill.get("bill_title"))}
+Bill Summary: {clean(bill.get("bill_summary"))}
+URL: {clean(bill.get("url"))}
+"""
+        )
+
+    bills_block = "\n".join(bill_lines)
+
+    return f"""
+You are generating a concise, executive-facing legislator briefing profile for Michigan SBDC outreach planning.
+
+Your job is to create a structured intelligence profile that is:
+- highly skimmable
+- bullet-based
+- grounded in the provided metadata and bill data
+- strategically useful for outreach
+- not redundant across sections
+- cautious about political inference
+- free of filler and generic language
+
+Do not invent facts.
+Do not include uncertainty language unless necessary.
+Do not write long paragraphs.
+Do not repeat the same bill or idea across multiple sections unless truly necessary.
+
+Return valid JSON only.
+No markdown.
+No code fences.
+
+Use exactly these keys:
+committee_relevance
+time_in_office_summary
+biography
+key_issues
+district_signals
+legislative_focus
+key_bills
+political_positioning
+sbdc_framing
+talking_points
+bill_count_sources
+
+Each value must be a list of concise bullet strings.
+
+Metadata:
+Legislator: {legislator}
+Chamber: {chamber}
+District: {district}
+Party: {party}
+Term dates: {term_dates}
+Time in office notes: {time_in_office_notes}
+Education: {education}
+Professional background: {professional_background}
+Government experience: {government_experience}
+Committee assignments: {committee_assignments}
+Counties: {counties}
+Sources / verification notes: {sources}
+
+Bills:
+{bills_block}
+
+Rules:
+1. committee_relevance:
+   Explain why the legislator's committees matter for SBDC or economic development conversations.
+
+2. time_in_office_summary:
+   Summarize service timeline and relevant term context.
+
+3. biography:
+   Use grounded identity/context bullets such as education, prior work, public service background.
+
+4. key_issues:
+   Identify issue areas consistently reflected in the bill set.
+
+5. district_signals:
+   Infer district-relevant patterns carefully from counties, region, committee context, and bill themes.
+
+6. legislative_focus:
+   Focus on what they appear to be actively working on legislatively.
+
+7. key_bills:
+   Highlight the strongest or most relevant substantive bills with brief plain-English explanations.
+
+8. political_positioning:
+   Keep this cautious and evidence-based. Describe practical ideological or policy tendencies only if supported.
+
+9. sbdc_framing:
+   Explain how SBDC could frame value or impact to this legislator.
+
+10. talking_points:
+    Provide strategic outreach angles, not scripts.
+
+11. bill_count_sources:
+    Include one or two bullets noting bill count used and that the profile is grounded in metadata plus legislative activity.
+
+Output must be valid JSON in this shape:
+{{
+  "committee_relevance": ["...", "..."],
+  "time_in_office_summary": ["...", "..."],
+  "biography": ["...", "..."],
+  "key_issues": ["...", "..."],
+  "district_signals": ["...", "..."],
+  "legislative_focus": ["...", "..."],
+  "key_bills": ["...", "..."],
+  "political_positioning": ["...", "..."],
+  "sbdc_framing": ["...", "..."],
+  "talking_points": ["...", "..."],
+  "bill_count_sources": ["...", "..."]
+}}
 """.strip()
 
-    payload = {
-        "metadata": metadata,
-        "selected_recent_bills": bills,
-        "signal_summary": {
-            "selected_bill_count": len(bills),
-            "substantive_bill_count": len(substantive_bills),
-            "ceremonial_bill_count": len(ceremonial_bills),
-            "has_substantive_bills": len(substantive_bills) > 0,
-            "has_only_ceremonial_bills": len(substantive_bills) == 0 and len(ceremonial_bills) > 0,
-        },
-    }
 
-    return f"{instructions}\n\nINPUT:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+# =========================
+# Gemini
+# =========================
 
-
-def extract_json(text: str) -> Dict[str, Any]:
-    text = (text or "").strip()
-
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("Model did not return valid JSON.")
-
-    return json.loads(text[start:end + 1])
-
-
-def call_gemini(client: genai.Client, prompt: str) -> Dict[str, Any]:
+def call_gemini_with_retries(client, prompt: str) -> str:
     last_error = None
 
     for attempt in range(1, PROFILE_MAX_RETRIES + 1):
@@ -470,438 +463,274 @@ def call_gemini(client: genai.Client, prompt: str) -> Dict[str, Any]:
                 model=GEMINI_MODEL,
                 contents=prompt,
             )
-            return extract_json(getattr(response, "text", ""))
-        except Exception as exc:
-            last_error = exc
-            msg = str(exc)
+            text = clean(getattr(response, "text", ""))
+            if not text:
+                raise RuntimeError("Gemini returned empty text.")
+            return text
 
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "503" in msg or "UNAVAILABLE" in msg:
-                if attempt < PROFILE_MAX_RETRIES:
-                    backoff_sleep(attempt)
-                    continue
+        except Exception as e:
+            error_text = str(e)
+            last_error = e
 
-            raise
+            if looks_like_quota_error(error_text):
+                print(f"Quota exhausted while building profile: {error_text}")
+                if STOP_ON_QUOTA_EXHAUSTION:
+                    raise
+                return ""
 
-    raise RuntimeError(f"Gemini failed after {PROFILE_MAX_RETRIES} retries: {last_error}")
+            print(f"Profile generation attempt {attempt} failed: {error_text}")
+
+            if attempt < PROFILE_MAX_RETRIES:
+                time.sleep(PROFILE_REQUEST_DELAY_SECONDS)
+
+    raise RuntimeError(f"Gemini profile generation failed after retries: {last_error}")
 
 
 # =========================
-# Cleanup helpers
+# Validation
 # =========================
-def clean_bullet_text(text: str) -> str:
-    text = (text or "").strip()
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip("•- ")
-    return text
 
-
-def clean_bullet_list(items: Any, max_items: int) -> List[str]:
-    if not isinstance(items, list):
-        return []
-
-    cleaned: List[str] = []
-    seen = set()
-
-    for item in items:
-        value = clean_bullet_text(str(item))
-        if not value:
-            continue
-
-        lowered = value.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-
-        cleaned.append(value)
-        if len(cleaned) >= max_items:
-            break
-
-    return cleaned
-
-
-def clean_summary_text(text: str, max_sentences: int = 2) -> str:
-    text = clean_bullet_text(text)
-    if not text:
-        return ""
-
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    parts = [p.strip() for p in parts if p.strip()]
-    if not parts:
-        return text
-
-    return " ".join(parts[:max_sentences])
-
-
-def normalize_for_similarity(text: str) -> str:
-    text = (text or "").lower()
-    text = re.sub(r"^[a-z\s/&-]+:\s*", "", text)
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def token_set(text: str) -> set[str]:
-    stop_words = {
-        "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "with",
-        "through", "from", "by", "that", "this", "their", "state", "local",
-        "support", "supports", "focus", "focused", "area", "issues", "policy",
-        "policies", "development", "economic", "programs", "funding"
+def normalize_profile_json(data: Dict[str, Any]) -> Dict[str, List[str]]:
+    required_keys = {
+        "committee_relevance",
+        "time_in_office_summary",
+        "biography",
+        "key_issues",
+        "district_signals",
+        "legislative_focus",
+        "key_bills",
+        "political_positioning",
+        "sbdc_framing",
+        "talking_points",
+        "bill_count_sources",
     }
-    tokens = set(normalize_for_similarity(text).split())
-    return {t for t in tokens if t and t not in stop_words}
 
+    normalized: Dict[str, List[str]] = {}
 
-def jaccard_similarity(a: str, b: str) -> float:
-    a_tokens = token_set(a)
-    b_tokens = token_set(b)
+    for key in required_keys:
+        value = data.get(key, [])
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            value = []
 
-    if not a_tokens or not b_tokens:
-        return 0.0
-
-    intersection = len(a_tokens & b_tokens)
-    union = len(a_tokens | b_tokens)
-    if union == 0:
-        return 0.0
-
-    return intersection / union
-
-
-def dedupe_against(reference_items: List[str], candidate_items: List[str], threshold: float = 0.72) -> List[str]:
-    kept: List[str] = []
-
-    for candidate in candidate_items:
-        is_duplicate = False
-
-        for reference in reference_items + kept:
-            if jaccard_similarity(candidate, reference) >= threshold:
-                is_duplicate = True
-                break
-
-        if not is_duplicate:
-            kept.append(candidate)
-
-    return kept
-
-
-def normalize_biography_items(items: Any) -> List[str]:
-    bullets = clean_bullet_list(items, 3)
-
-    normalized = []
-    seen_labels = set()
-
-    for bullet in bullets:
-        if ":" not in bullet:
-            continue
-
-        label, rest = bullet.split(":", 1)
-        label = label.strip().lower()
-        rest = rest.strip()
-
-        if not rest:
-            continue
-
-        if "education" in label:
-            clean_label = "Education"
-        elif "professional" in label or "business" in label or "career" in label:
-            clean_label = "Professional Experience"
-        elif "public" in label or "government" in label or "service" in label:
-            clean_label = "Public Service"
-        else:
-            continue
-
-        if clean_label in seen_labels:
-            continue
-        seen_labels.add(clean_label)
-
-        normalized.append(f"{clean_label}: {rest}")
+        cleaned_items = [clean(v) for v in value if clean(v)]
+        normalized[key] = cleaned_items
 
     return normalized
 
 
-def normalize_focus_items(items: Any) -> List[str]:
-    bullets = clean_bullet_list(items, 5)
-    out = []
+def profile_is_valid(profile: Dict[str, List[str]]) -> bool:
+    if not profile:
+        return False
 
-    for bullet in bullets:
-        bullet = re.sub(r"^focus area:\s*", "", bullet, flags=re.IGNORECASE)
-        out.append(bullet)
-
-    return out
-
-
-def normalize_committee_relevance(items: Any, metadata_committee_assignments: str) -> str:
-    parsed_items: List[str] = []
-
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            committee = clean_bullet_text(str(item.get("committee", "")).strip())
-            relevance = clean_summary_text(str(item.get("relevance", "")).strip(), max_sentences=1)
-
-            if committee and relevance:
-                parsed_items.append(f"{committee}::{relevance}")
-
-    if parsed_items:
-        return " || ".join(parsed_items[:4])
-
-    fallback_committees = [x.strip() for x in (metadata_committee_assignments or "").split("|") if x.strip()]
-    fallback_items = []
-
-    for committee in fallback_committees[:3]:
-        fallback_items.append(f"{committee}::Relevant to business climate, funding, or district-facing policy decisions.")
-
-    return " || ".join(fallback_items)
-
-
-def normalize_sbdc_framing(text: str) -> str:
-    text = clean_summary_text(text, max_sentences=3)
-
-    replacements = {
-        "Frame SBDC outreach around how services provide tangible local economic impact": "Frame SBDC outreach around tangible local economic impact",
-        "Emphasize success stories that highlight": "Use success stories that highlight",
-        "Discuss how SBDC services can help": "Show how SBDC support can help",
-        "Highlight how SBDC services can help": "Show how SBDC services help",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    return text.strip()
-
-
-# =========================
-# Transform helpers
-# =========================
-def join_pipe(items: Any) -> str:
-    if not isinstance(items, list):
-        return ""
-    return " | ".join([str(x).strip() for x in items if str(x).strip()])
-
-
-def normalize_key_bills(items: Any, selected_bills: List[Dict[str, str]]) -> str:
-    substantive_selected = [b for b in selected_bills if bill_is_substantive(b.get("bill_number", ""))]
-    ceremonial_selected = [b for b in selected_bills if bill_is_ceremonial(b.get("bill_number", ""))]
-
-    out: List[str] = []
-
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            bill_number = str(
-                item.get("bill_number")
-                or item.get("bill")
-                or item.get("number")
-                or ""
-            ).strip()
-
-            summary = str(
-                item.get("summary")
-                or item.get("bill_summary")
-                or item.get("description")
-                or ""
-            ).strip()
-
-            summary = clean_summary_text(summary, max_sentences=1)
-
-            if not bill_number or not summary:
-                continue
-
-            if substantive_selected and bill_is_ceremonial(bill_number):
-                continue
-
-            out.append(f"{bill_number}::{summary}")
-
-    if out:
-        return " || ".join(out[:5])
-
-    fallback_source = substantive_selected if substantive_selected else ceremonial_selected if ceremonial_selected else selected_bills
-
-    fallback_out: List[str] = []
-    for bill in fallback_source[:5]:
-        bill_number = bill.get("bill_number", "").strip()
-        bill_title = clean_bullet_text(bill.get("bill_title", "").strip())
-        bill_summary = clean_summary_text(bill.get("bill_summary", "").strip(), max_sentences=1)
-
-        if not bill_number or not bill_summary:
-            continue
-
-        if bill_title:
-            fallback_out.append(f"{bill_number}::{bill_title} — {bill_summary}")
-        else:
-            fallback_out.append(f"{bill_number}::{bill_summary}")
-
-    return " || ".join(fallback_out)
-
-
-def to_sheet_row(
-    legislator: str,
-    metadata: Dict[str, str],
-    result: Dict[str, Any],
-    bills: List[Dict[str, str]],
-) -> List[str]:
-    committee_relevance_summary = normalize_committee_relevance(
-        result.get("committee_relevance_summary", []),
-        metadata.get("committee_assignments", ""),
-    )
-
-    time_in_office_items = clean_bullet_list(result.get("time_in_office_summary", []), 3)
-    generated_biography_items = normalize_biography_items(result.get("generated_biography", []))
-    key_issues_items = clean_bullet_list(result.get("key_issues", []), 5)
-    district_signal_items = clean_bullet_list(result.get("district_development_signals", []), 4)
-    legislative_focus_items = normalize_focus_items(result.get("legislative_focus_areas", []))
-
-    district_signal_items = dedupe_against(key_issues_items, district_signal_items, threshold=0.68)
-    legislative_focus_items = dedupe_against(key_issues_items + district_signal_items, legislative_focus_items, threshold=0.68)
-
-    if not district_signal_items:
-        district_signal_items = clean_bullet_list(result.get("district_development_signals", []), 2)
-
-    if not legislative_focus_items:
-        legislative_focus_items = normalize_focus_items(result.get("legislative_focus_areas", []))[:2]
-
-    key_bills = normalize_key_bills(result.get("key_bills", []), bills)
-
-    political_positioning = clean_bullet_text(
-        str(result.get("political_positioning", "")).strip()
-    )
-
-    political_positioning_bullets = join_pipe(
-        clean_bullet_list(result.get("political_positioning_bullets", []), 3)
-    )
-
-    sbdc_framing = normalize_sbdc_framing(
-        str(result.get("sbdc_framing", "")).strip()
-    )
-
-    talking_points = join_pipe(
-        clean_bullet_list(result.get("talking_points", []), 5)
-    )
-
-    bills_analyzed_count = str(len(bills))
-    source_bill_numbers = " | ".join([b["bill_number"] for b in bills])
-    last_updated = datetime.now(timezone.utc).isoformat()
-    profile_processed = "TRUE"
-    notes = ""
-
-    return [
-        legislator,                                    # A
-        committee_relevance_summary,                   # B
-        join_pipe(time_in_office_items),              # C
-        join_pipe(generated_biography_items),         # D
-        join_pipe(key_issues_items),                  # E
-        join_pipe(district_signal_items),             # F
-        join_pipe(legislative_focus_items),           # G
-        key_bills,                                    # H
-        political_positioning,                        # I
-        political_positioning_bullets,                # J
-        sbdc_framing,                                 # K
-        talking_points,                               # L
-        bills_analyzed_count,                         # M
-        source_bill_numbers,                          # N
-        last_updated,                                 # O
-        profile_processed,                            # P
-        notes,                                        # Q
+    required_nonempty = [
+        "committee_relevance",
+        "biography",
+        "key_issues",
+        "legislative_focus",
+        "key_bills",
+        "sbdc_framing",
+        "talking_points",
     ]
 
+    for key in required_nonempty:
+        items = profile.get(key, [])
+        if not items:
+            return False
 
-def to_error_row(legislator: str, bills: List[Dict[str, str]], error: str) -> List[str]:
-    return [
-        legislator,                                    # A
-        "",                                            # B
-        "",                                            # C
-        "",                                            # D
-        "",                                            # E
-        "",                                            # F
-        "",                                            # G
-        "",                                            # H
-        "",                                            # I
-        "",                                            # J
-        "",                                            # K
-        "",                                            # L
-        str(len(bills)),                               # M
-        " | ".join([b["bill_number"] for b in bills]), # N
-        datetime.now(timezone.utc).isoformat(),        # O
-        "FALSE",                                       # P
-        error[:500],                                   # Q
-    ]
+        joined = " ".join(items)
+        if looks_like_error_output(joined):
+            return False
+
+    return True
 
 
-def write_profile(service, existing_profiles: Dict[str, int], row_values: List[str]) -> None:
-    legislator = row_values[0]
-
-    if legislator in existing_profiles:
-        row_num = existing_profiles[legislator]
-        target_range = f"Profiles_Dynamic!A{row_num}:Q{row_num}"
-        sheets_update_range(service, target_range, [row_values])
-    else:
-        sheets_append_rows(service, "Profiles_Dynamic!A:Q", [row_values])
+def bullets_to_multiline(items: List[str]) -> str:
+    return "\n".join(f"• {item}" for item in items if clean(item))
 
 
 # =========================
-# Main
+# Main Logic
 # =========================
+
+def build_metadata_index(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = clean(row.get("legislator")).lower()
+        if key:
+            index[key] = row
+    return index
+
+
+def build_legislator_list(metadata_rows: List[Dict[str, Any]], activity_rows: List[Dict[str, Any]]) -> List[str]:
+    names = set()
+
+    for row in metadata_rows:
+        name = clean(row.get("legislator"))
+        if name:
+            names.add(name)
+
+    for row in activity_rows:
+        name = clean(row.get("legislator"))
+        if name:
+            names.add(name)
+
+    ordered = sorted(names)
+
+    if ONLY_LEGISLATOR:
+        ordered = [name for name in ordered if name.lower() == ONLY_LEGISLATOR.lower()]
+
+    return ordered
+
+
 def main():
-    print(f"GEMINI_MODEL: {GEMINI_MODEL}")
-    print(f"MAX_BILLS_PER_LEGISLATOR: {MAX_BILLS_PER_LEGISLATOR}")
-    print(f"PROFILE_MAX_RETRIES: {PROFILE_MAX_RETRIES}")
-    print(f"PROFILE_REQUEST_DELAY_SECONDS: {PROFILE_REQUEST_DELAY_SECONDS}")
-    print(f"MIN_BILLS_REQUIRED: {MIN_BILLS_REQUIRED}")
-    if ONLY_LEGISLATOR:
-        print(f"ONLY_LEGISLATOR: {ONLY_LEGISLATOR}")
+    print("Connecting to Google Sheets and Gemini...")
+    sheets_service = get_sheets_service()
+    gemini_client = get_gemini_client()
 
-    service = get_sheets_service()
-    client = build_client()
+    print("Loading tabs...")
+    profile_headers, profile_rows = rows_as_dicts_with_headers(sheets_service, TAB_PROFILES)
+    metadata_headers, metadata_rows = rows_as_dicts_with_headers(sheets_service, TAB_METADATA)
+    activity_headers, activity_rows = rows_as_dicts_with_headers(sheets_service, TAB_ACTIVITY)
 
-    metadata_by_legislator = load_metadata(service)
-    activity_by_legislator = load_activity(service)
-    existing_profiles = load_existing_profiles(service)
+    if not metadata_rows:
+        raise RuntimeError(f"No rows found in {TAB_METADATA}")
 
-    legislators = sorted(set(metadata_by_legislator.keys()) & set(activity_by_legislator.keys()))
+    if not activity_rows:
+        raise RuntimeError(f"No rows found in {TAB_ACTIVITY}")
 
-    if ONLY_LEGISLATOR:
-        legislators = [name for name in legislators if name == ONLY_LEGISLATOR]
+    profile_headers, profile_header_index = ensure_profiles_headers(sheets_service)
+    _, profile_rows = rows_as_dicts_with_headers(sheets_service, TAB_PROFILES)
 
-    print(f"Found {len(legislators)} legislator(s) with both metadata and processed bills.")
+    metadata_index = build_metadata_index(metadata_rows)
+    legislators = build_legislator_list(metadata_rows, activity_rows)
+
+    print(f"Legislators to evaluate: {len(legislators)}")
 
     for legislator in legislators:
-        metadata = metadata_by_legislator[legislator]
-        all_bills = activity_by_legislator[legislator]
+        print(f"\nEvaluating {legislator}")
 
-        if len(all_bills) < MIN_BILLS_REQUIRED:
-            print(f"Skipping {legislator}: not enough processed bills yet ({len(all_bills)}).")
+        existing_profile_row = find_profile_row(profile_rows, legislator)
+
+        if existing_profile_row and SKIP_ALREADY_PROCESSED_PROFILES and bool_from_cell(existing_profile_row.get("processed")):
+            print(f"Skipping {legislator}: profile already processed.")
             continue
 
-        selected_bills = select_best_bills(all_bills, MAX_BILLS_PER_LEGISLATOR)
+        metadata = metadata_index.get(legislator.lower())
+        if not metadata:
+            print(f"Skipping {legislator}: no metadata row.")
+            continue
 
-        substantive_count = sum(1 for b in selected_bills if bill_is_substantive(b.get("bill_number", "")))
-        ceremonial_count = sum(1 for b in selected_bills if bill_is_ceremonial(b.get("bill_number", "")))
+        legislator_activity = get_legislator_activity(activity_rows, legislator)
+        if not legislator_activity:
+            print(f"Skipping {legislator}: no enriched activity.")
+            continue
 
-        print(f"Building profile for {legislator} using {len(selected_bills)} selected bill(s)...")
-        print(f"  substantive selected: {substantive_count}")
-        print(f"  ceremonial selected: {ceremonial_count}")
-        for bill in selected_bills:
-            print(f"  - {bill['bill_number']}")
+        selected_bills = select_best_bills(legislator_activity, MAX_BILLS_PER_LEGISLATOR)
+        substantive_count = sum(
+            1 for bill in selected_bills if is_substantive_bill_number(bill.get("bill_number", ""))
+        )
+
+        if substantive_count < MIN_SUBSTANTIVE_BILLS_REQUIRED:
+            print(
+                f"Skipping {legislator}: only {substantive_count} substantive bills available, "
+                f"minimum required is {MIN_SUBSTANTIVE_BILLS_REQUIRED}."
+            )
+            continue
+
+        prompt = build_legislator_prompt(metadata, selected_bills)
 
         try:
-            prompt = build_prompt(metadata, selected_bills)
-            result = call_gemini(client, prompt)
+            raw_text = call_gemini_with_retries(gemini_client, prompt)
+        except Exception as e:
+            error_text = str(e)
+            print(f"Profile generation failed for {legislator}: {error_text}")
 
-            row_values = to_sheet_row(legislator, metadata, result, selected_bills)
-            write_profile(service, existing_profiles, row_values)
+            if looks_like_quota_error(error_text) and STOP_ON_QUOTA_EXHAUSTION:
+                print("Stopping profile builder because quota was exhausted. Existing sheet data was preserved.")
+                break
 
-            print(f"Updated profile: {legislator}")
+            print("Existing profile left unchanged.")
+            continue
 
-            if PROFILE_REQUEST_DELAY_SECONDS > 0:
-                time.sleep(PROFILE_REQUEST_DELAY_SECONDS)
+        if not raw_text:
+            print(f"No profile text returned for {legislator}. Existing profile left unchanged.")
+            continue
 
-        except Exception as exc:
-            print(f"Failed profile for {legislator}: {exc}")
-            row_values = to_error_row(legislator, selected_bills, f"Error: {exc}")
-            write_profile(service, existing_profiles, row_values)
+        if looks_like_error_output(raw_text):
+            print(f"Gemini returned error-like output for {legislator}. Existing profile left unchanged.")
+            continue
+
+        try:
+            parsed = parse_json_response(raw_text)
+            normalized_profile = normalize_profile_json(parsed)
+        except Exception as e:
+            print(f"Failed to parse profile JSON for {legislator}: {e}")
+            print("Existing profile left unchanged.")
+            continue
+
+        if not profile_is_valid(normalized_profile):
+            print(f"Generated profile for {legislator} did not pass validation.")
+            print("Existing profile left unchanged.")
+            continue
+
+        bill_sources = []
+        for bill in selected_bills:
+            number = clean(bill.get("bill_number"))
+            url = clean(bill.get("url"))
+            if number and url:
+                bill_sources.append(f"{number}: {url}")
+
+        source_note = [
+            f"Built from {len(selected_bills)} selected bills, including {substantive_count} substantive bill(s).",
+            "Grounded in Legislator_Metadata and Activity_Items data.",
+        ]
+        normalized_profile["bill_count_sources"] = normalized_profile.get("bill_count_sources", []) + source_note
+
+        row_values = {
+            "Legislator": legislator,
+            "Committee relevance": bullets_to_multiline(normalized_profile["committee_relevance"]),
+            "Time in office summary": bullets_to_multiline(normalized_profile["time_in_office_summary"]),
+            "Biography": bullets_to_multiline(normalized_profile["biography"]),
+            "Key issues": bullets_to_multiline(normalized_profile["key_issues"]),
+            "District signals": bullets_to_multiline(normalized_profile["district_signals"]),
+            "Legislative focus": bullets_to_multiline(normalized_profile["legislative_focus"]),
+            "Key bills": bullets_to_multiline(normalized_profile["key_bills"]),
+            "Political positioning": bullets_to_multiline(normalized_profile["political_positioning"]),
+            "SBDC framing": bullets_to_multiline(normalized_profile["sbdc_framing"]),
+            "Talking points": bullets_to_multiline(normalized_profile["talking_points"]),
+            "Bill count + sources": bullets_to_multiline(normalized_profile["bill_count_sources"]),
+            "Processed": "TRUE",
+        }
+
+        # SAFE WRITE RULE:
+        # Only now, after full successful generation and validation,
+        # do we write anything to the sheet.
+        if existing_profile_row:
+            target_row_number = int(existing_profile_row["_row_number"])
+        else:
+            target_row_number = append_new_profile_row(sheets_service, legislator)
+            _, profile_rows = rows_as_dicts_with_headers(sheets_service, TAB_PROFILES)
+
+        try:
+            batch_update_profile_row(
+                sheets_service,
+                row_number=target_row_number,
+                header_index=profile_header_index,
+                values_by_header=row_values,
+            )
+            print(f"Profile updated safely for {legislator}.")
+        except Exception as e:
+            print(f"Write failed for {legislator}: {e}")
+            print("Any existing prior data in the sheet was preserved until this final write step.")
+
+        # Refresh in-memory profile rows after each success
+        _, profile_rows = rows_as_dicts_with_headers(sheets_service, TAB_PROFILES)
+
+        time.sleep(PROFILE_REQUEST_DELAY_SECONDS)
+
+    print("\nProfile builder complete.")
 
 
 if __name__ == "__main__":
