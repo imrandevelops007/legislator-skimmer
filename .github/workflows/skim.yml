@@ -61,16 +61,10 @@ jobs:
         run: |
           python profile_builder.py
 
-      - name: Generate PDF reports
+      - name: Generate and upload reports
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          ONLY_LEGISLATOR: "John Fitzgerald"
-        run: |
-          python report_generator.py
-
-      - name: Upload generated reports as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: legislator-reports
-          path: generated_reports/
+          DRIVE_REPORTS_FOLDER_ID: ${{ secrets.DRIVE_REPORTS_FOLDER_ID }}
+          OVERWRITE_EXISTING_IN_TARGET_FOLDER: "true"
+        run: python report_generator.py
