@@ -25,10 +25,9 @@ MAX_BILLS_PER_LEGISLATOR = int(os.getenv("MAX_BILLS_PER_LEGISLATOR", "8"))
 MIN_SUBSTANTIVE_BILLS_REQUIRED = int(os.getenv("MIN_SUBSTANTIVE_BILLS_REQUIRED", "4"))
 
 PROFILE_MAX_RETRIES = int(os.getenv("PROFILE_MAX_RETRIES", "2"))
-PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "4"))
+PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "5"))
 
 STOP_ON_QUOTA_EXHAUSTION = os.getenv("STOP_ON_QUOTA_EXHAUSTION", "true").strip().lower() == "true"
-SKIP_ALREADY_PROCESSED_PROFILES = os.getenv("SKIP_ALREADY_PROCESSED_PROFILES", "false").strip().lower() == "true"
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -59,6 +58,7 @@ PROFILE_COLUMNS = [
     "Last_Updated",
     "Profile_Processed",
     "Notes",
+    "Needs_Rebuild",
 ]
 
 
@@ -605,6 +605,21 @@ def build_legislator_list(metadata_rows: List[Dict[str, Any]], activity_rows: Li
     return ordered
 
 
+def should_rebuild_profile(existing_profile_row: Optional[Dict[str, Any]]) -> bool:
+    if not existing_profile_row:
+        return True
+
+    processed = bool_from_cell(existing_profile_row.get("profile_processed"))
+    needs_rebuild = bool_from_cell(existing_profile_row.get("needs_rebuild"))
+
+    if not processed:
+        return True
+    if needs_rebuild:
+        return True
+
+    return False
+
+
 def main():
     print("Connecting to Google Sheets and Gemini...")
     sheets_service = get_sheets_service()
@@ -632,12 +647,8 @@ def main():
 
         existing_profile_row = find_profile_row(profile_rows, legislator)
 
-        if (
-            existing_profile_row
-            and SKIP_ALREADY_PROCESSED_PROFILES
-            and bool_from_cell(existing_profile_row.get("profile_processed"))
-        ):
-            print(f"Skipping {legislator}: profile already processed.")
+        if not should_rebuild_profile(existing_profile_row):
+            print(f"Skipping {legislator}: profile is already processed and does not need rebuild.")
             continue
 
         metadata = metadata_index.get(legislator.lower())
@@ -721,13 +732,13 @@ def main():
             "Source_Bill_Numbers": ", ".join(source_bill_numbers),
             "Last_Updated": now_iso_utc(),
             "Profile_Processed": "TRUE",
+            "Needs_Rebuild": "FALSE",
         }
 
         existing_notes = clean(existing_profile_row.get("notes")) if existing_profile_row else ""
         if existing_notes:
             row_values["Notes"] = existing_notes
 
-        # Safe write happens only after full successful generation and validation.
         if existing_profile_row:
             target_row_number = int(existing_profile_row["_row_number"])
         else:
