@@ -70,7 +70,6 @@ jobs:
           TEMPLATE_DIR: templates
           REPORT_TEMPLATE: report.html
           OVERWRITE_EXISTING_IN_TARGET_FOLDER: "true"
-          ONLY_LEGISLATOR: "John Fitzgerald"
           ONLY_PROCESSED_PROFILES: "true"
         run: |
           python report_generator.py
