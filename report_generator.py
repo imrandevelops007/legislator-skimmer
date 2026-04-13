@@ -1,468 +1,508 @@
 import os
-import json
+import io
 import re
-from typing import List, Dict, Tuple
+import json
+import html
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from weasyprint import HTML, CSS
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from jinja2 import Environment, FileSystemLoader
-from weasyprint import HTML
+from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 
 
 # =========================
 # Config
 # =========================
-SHEET_ID = os.environ["SHEET_ID"]
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+SHEET_ID = os.environ["SHEET_ID"]
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+
+# Shared Drive target folder for finished PDFs
+DRIVE_REPORTS_FOLDER_ID = os.environ["DRIVE_REPORTS_FOLDER_ID"]
+
+# Optional: if you know the Shared Drive ID, you can set it.
+# Not required for uploads if folder permissions are correct, but useful for clarity.
+DRIVE_SHARED_ID = os.getenv("DRIVE_SHARED_ID", "").strip()
+
+# Safe behavior:
+# true  -> replace files with the same name, but ONLY inside the target folder
+# false -> keep old files and upload new ones alongside them
+OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
+    os.getenv("OVERWRITE_EXISTING_IN_TARGET_FOLDER", "true").strip().lower() == "true"
+)
+
+# Local output folder during generation
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "generated_reports"))
+TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "."))
+TEMPLATE_NAME = os.getenv("REPORT_TEMPLATE", "report.html")
+STATIC_DIR = Path(os.getenv("STATIC_DIR", "."))
+
+# Google Sheets tabs
+TAB_LEGISLATORS = os.getenv("TAB_LEGISLATORS", "Legislators")
+TAB_METADATA = os.getenv("TAB_METADATA", "Legislator_Metadata")
+TAB_PROFILES = os.getenv("TAB_PROFILES", "Profiles_Dynamic")
+
+# Only generate reports for processed profiles by default
+ONLY_PROCESSED_PROFILES = os.getenv("ONLY_PROCESSED_PROFILES", "true").strip().lower() == "true"
+
+# Optional: generate for only one legislator
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
-LEGISLATORS_RANGE = "Legislators!A2:F"
-METADATA_RANGE = "Legislator_Metadata!A2:Q"
-PROFILES_RANGE = "Profiles_Dynamic!A2:Q"
+# Whether to mark profile rows as processed after successful generation/upload
+MARK_PROFILES_PROCESSED = os.getenv("MARK_PROFILES_PROCESSED", "false").strip().lower() == "true"
 
-OUTPUT_DIR = "generated_reports"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 
 # =========================
 # Helpers
 # =========================
-def pad_row(row: List[str], target_len: int) -> List[str]:
-    return row + [""] * (target_len - len(row))
+
+def normalize_header(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_")
 
 
-def split_pipe(text: str) -> List[str]:
-    return [x.strip() for x in (text or "").split("|") if x.strip()]
+def slugify_filename(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[-\s]+", "_", text)
+    return text.strip("_")
 
 
-def split_key_bills(text: str) -> List[str]:
-    items = []
-    for part in (text or "").split("||"):
-        part = part.strip()
-        if not part:
-            continue
-        if "::" in part:
-            bill, summary = part.split("::", 1)
-            items.append(f"{bill.strip()} – {summary.strip()}")
-        else:
-            items.append(part)
-    return items
+def bool_from_cell(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "yes", "1", "y"}
 
 
-def get_party_color(party: str) -> str:
-    party = (party or "").strip().lower()
-    if party == "republican":
-        return "#b71c1c"
-    if party == "democratic":
-        return "#0d47a1"
-    return "#222222"
+def clean_cell(value: Any) -> str:
+    return "" if value is None else str(value).strip()
 
 
-def format_party_label(party: str) -> str:
-    party = (party or "").strip().lower()
-    if party == "republican":
-        return "Republican"
-    if party == "democratic":
-        return "Democratic"
-    if party:
-        return party.title()
-    return ""
-
-
-def slugify(name: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
-    return value or "report"
-
-
-def format_counties_full(counties: str) -> str:
-    parts = [c.strip() for c in (counties or "").split("|") if c.strip()]
-    return ", ".join(parts)
-
-
-def parse_biography_items(text: str) -> List[Tuple[str, str]]:
-    items = []
-    for raw in split_pipe(text):
-        if ":" in raw:
-            label, body = raw.split(":", 1)
-            items.append((label.strip(), body.strip()))
-        else:
-            items.append(("", raw.strip()))
-    return items
-
-
-def parse_labeled_items(text: str) -> List[Tuple[str, str]]:
-    items = []
-    for raw in split_pipe(text):
-        if ":" in raw:
-            label, body = raw.split(":", 1)
-            items.append((label.strip(), body.strip()))
-        else:
-            items.append(("", raw.strip()))
-    return items
-
-
-def parse_committee_items(text: str) -> List[Tuple[str, str]]:
-    items = []
-    for raw in (text or "").split("||"):
-        raw = raw.strip()
-        if not raw:
-            continue
-        if "::" in raw:
-            committee, relevance = raw.split("::", 1)
-            items.append((committee.strip(), relevance.strip()))
-        else:
-            items.append((raw.strip(), ""))
-    return items
-
-
-def normalize_committee_name(name: str) -> str:
-    value = (name or "").strip()
-
-    if value.lower() == "appropriations":
-        return "Appropriations Committee"
-
-    value = re.sub(r"\bLEO\b", "Labor and Economic Opportunity", value)
-    value = re.sub(r"\bEGLE\b", "Environment, Great Lakes, and Energy", value)
-
-    if value.startswith("Labor and Economic Opportunity Appropriations"):
-        value = value.replace(
-            "Labor and Economic Opportunity Appropriations",
-            "Appropriations Subcommittee on Labor and Economic Opportunity",
-            1,
-        )
-
-    if value.startswith("LEO Appropriations"):
-        value = value.replace(
-            "LEO Appropriations",
-            "Appropriations Subcommittee on Labor and Economic Opportunity",
-            1,
-        )
-
-    if value.startswith("School Aid"):
-        value = value.replace(
-            "School Aid",
-            "Appropriations Subcommittee on School Aid and Department of Education",
-            1,
-        )
-
-    if value.startswith("Higher Education"):
-        value = value.replace(
-            "Higher Education",
-            "Appropriations Subcommittee on Higher Education and Community Colleges",
-            1,
-        )
-
-    return value
-
-
-def parse_year_from_date(date_text: str) -> int | None:
-    match = re.search(r"(\d{4})", date_text or "")
-    if not match:
-        return None
-    return int(match.group(1))
-
-
-def extract_previous_service_ranges(note: str) -> List[Tuple[int, int]]:
-    if not note:
+def split_lines(value: str) -> List[str]:
+    if not value:
         return []
-
-    note_lower = note.lower()
-    ranges: List[Tuple[int, int]] = []
-
-    previous_section_match = re.search(r"previously served.*", note_lower)
-    if previous_section_match:
-        previous_text = previous_section_match.group(0)
-        for start, end in re.findall(r"(\d{4})\s*(?:-|–|to)\s*(\d{4})", previous_text):
-            start_year = int(start)
-            end_year = int(end)
-            if end_year >= start_year:
-                ranges.append((start_year, end_year))
-
-    return ranges
+    return [line.strip("• ").strip() for line in str(value).splitlines() if line.strip()]
 
 
-def estimate_legislative_service_years(row: Dict[str, str]) -> int | None:
-    note = row.get("Time_In_Office_Note", "") or ""
-    current_term_start = row.get("Current_Term_Start", "") or ""
-    current_term_end = row.get("Current_Term_End", "") or ""
-
-    start_year = parse_year_from_date(current_term_start)
-    end_year = parse_year_from_date(current_term_end)
-
-    if not start_year or not end_year or end_year <= start_year:
-        return None
-
-    current_term_years = end_year - start_year
-
-    since_match = re.search(r"since\s+(?:jan\.?\s*1,\s*)?(\d{4})", note, flags=re.IGNORECASE)
-    if since_match and "previously served" not in note.lower():
-        since_year = int(since_match.group(1))
-        if end_year > since_year:
-            return end_year - since_year
-
-    total_years = current_term_years
-
-    for prior_start, prior_end in extract_previous_service_ranges(note):
-        total_years += (prior_end - prior_start + 1)
-
-    return total_years
+def maybe_bullets(value: str) -> List[str]:
+    """
+    Converts multiline text into bullet items.
+    If there is only one line, returns [line].
+    """
+    lines = split_lines(value)
+    return lines if lines else []
 
 
-def build_term_limit_note(row: Dict[str, str]) -> str:
-    projected_years = estimate_legislative_service_years(row)
-    if projected_years is None:
+def safe_html(text: str) -> str:
+    return html.escape(text or "")
+
+
+def bullets_to_html(items: List[str]) -> str:
+    if not items:
         return ""
+    lis = "".join(f"<li>{safe_html(item)}</li>" for item in items)
+    return f"<ul>{lis}</ul>"
 
-    remaining = 12 - projected_years
 
-    if remaining <= 0:
-        return (
-            f"Projected to reach Michigan's 12-year legislative service cap at the end of this term "
-            f"({projected_years} years total); another legislative run would likely not be available."
-        )
+def rich_text_to_html(value: str) -> str:
+    """
+    Converts multiline plain text into a simple HTML bullet list.
+    """
+    items = maybe_bullets(value)
+    return bullets_to_html(items)
 
-    if remaining >= 4:
-        return (
-            f"Projected legislative service at the end of this term: {projected_years} years; "
-            f"still below Michigan's 12-year cap and eligible to seek another legislative term."
-        )
 
-    if remaining >= 2:
-        return (
-            f"Projected legislative service at the end of this term: {projected_years} years; "
-            f"still below Michigan's 12-year cap, though future eligibility will depend on the next term sought."
-        )
+def extract_party_color(party: str) -> str:
+    party = clean_cell(party).lower()
+    if party.startswith("d"):
+        return "#1D4ED8"  # blue
+    if party.startswith("r"):
+        return "#B91C1C"  # red
+    return "#374151"      # neutral gray
 
-    return (
-        f"Projected legislative service at the end of this term: {projected_years} years; "
-        f"near Michigan's 12-year cap, so future eligibility would likely be limited."
-    )
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 # =========================
-# Google API clients
+# Google API Clients
 # =========================
-def get_creds():
-    info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    return Credentials.from_service_account_info(info, scopes=SCOPES)
+
+def get_credentials() -> Credentials:
+    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    return Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 
 
 def get_sheets_service():
-    return build("sheets", "v4", credentials=get_creds())
+    creds = get_credentials()
+    return build("sheets", "v4", credentials=creds)
 
 
-def sheets_get_values(service, rng: str) -> List[List[str]]:
-    return (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=SHEET_ID, range=rng)
-        .execute()
-        .get("values", [])
+def get_drive_service():
+    creds = get_credentials()
+    return build("drive", "v3", credentials=creds)
+
+
+# =========================
+# Google Sheets Access
+# =========================
+
+def read_sheet_as_dicts(service, spreadsheet_id: str, tab_name: str) -> List[Dict[str, str]]:
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=tab_name
+    ).execute()
+
+    values = result.get("values", [])
+    if not values:
+        return []
+
+    headers = [normalize_header(h) for h in values[0]]
+    rows = []
+
+    for row in values[1:]:
+        padded = row + [""] * (len(headers) - len(row))
+        rows.append({headers[i]: padded[i] for i in range(len(headers))})
+
+    return rows
+
+
+def read_sheet_with_row_numbers(service, spreadsheet_id: str, tab_name: str) -> List[Dict[str, Any]]:
+    """
+    Same as read_sheet_as_dicts but preserves actual sheet row number.
+    Useful if you want to write back to the sheet later.
+    """
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=tab_name
+    ).execute()
+
+    values = result.get("values", [])
+    if not values:
+        return []
+
+    headers = [normalize_header(h) for h in values[0]]
+    rows = []
+
+    for i, row in enumerate(values[1:], start=2):
+        padded = row + [""] * (len(headers) - len(row))
+        item = {headers[j]: padded[j] for j in range(len(headers))}
+        item["_sheet_row_number"] = i
+        rows.append(item)
+
+    return rows
+
+
+def update_cell(service, spreadsheet_id: str, tab_name: str, a1_range: str, value: str) -> None:
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_name}!{a1_range}",
+        valueInputOption="RAW",
+        body={"values": [[value]]},
+    ).execute()
+
+
+def build_index(rows: List[Dict[str, Any]], key_candidates: List[str]) -> Dict[str, Dict[str, Any]]:
+    index = {}
+    for row in rows:
+        key = ""
+        for candidate in key_candidates:
+            if clean_cell(row.get(candidate)):
+                key = clean_cell(row.get(candidate))
+                break
+        if key:
+            index[key.lower()] = row
+    return index
+
+
+# =========================
+# Drive Upload Logic
+# =========================
+
+def list_files_with_same_name_in_folder(
+    drive_service,
+    folder_id: str,
+    filename: str,
+) -> List[Dict[str, str]]:
+    """
+    Looks ONLY inside the target folder.
+    Does not search elsewhere in the drive.
+    """
+    escaped_name = filename.replace("'", r"\'")
+    query = (
+        f"'{folder_id}' in parents and "
+        f"name = '{escaped_name}' and "
+        f"trashed = false"
+    )
+
+    response = drive_service.files().list(
+        q=query,
+        fields="files(id, name, webViewLink)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        corpora="allDrives",
+    ).execute()
+
+    return response.get("files", [])
+
+
+def delete_drive_file(drive_service, file_id: str) -> None:
+    drive_service.files().delete(
+        fileId=file_id,
+        supportsAllDrives=True,
+    ).execute()
+
+
+def upload_pdf_to_drive(
+    drive_service,
+    pdf_path: Path,
+    folder_id: str,
+    overwrite_existing: bool = True,
+) -> Dict[str, str]:
+    """
+    Safe upload behavior:
+    - Only interacts with the specified target folder
+    - Optionally replaces matching filename ONLY in that folder
+    """
+    filename = pdf_path.name
+
+    if overwrite_existing:
+        existing_files = list_files_with_same_name_in_folder(drive_service, folder_id, filename)
+        for existing in existing_files:
+            print(f"Deleting existing file in target folder only: {existing['name']} ({existing['id']})")
+            delete_drive_file(drive_service, existing["id"])
+
+    file_metadata = {
+        "name": filename,
+        "parents": [folder_id],
+        "mimeType": "application/pdf",
+    }
+
+    with pdf_path.open("rb") as f:
+        media = MediaIoBaseUpload(f, mimetype="application/pdf", resumable=True)
+
+        created = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+
+    print(f"Uploaded to Drive: {created['name']} ({created['id']})")
+    return created
+
+
+# =========================
+# Report Rendering
+# =========================
+
+def load_template_env(template_dir: Path) -> Environment:
+    return Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        autoescape=select_autoescape(["html", "xml"]),
+    )
+
+
+def prepare_report_context(
+    legislator_row: Dict[str, Any],
+    metadata_row: Dict[str, Any],
+    profile_row: Dict[str, Any],
+) -> Dict[str, Any]:
+    legislator_name = clean_cell(
+        metadata_row.get("legislator")
+        or profile_row.get("legislator")
+        or legislator_row.get("legislator")
+    )
+
+    party = clean_cell(metadata_row.get("party"))
+    district = clean_cell(metadata_row.get("district"))
+    chamber = clean_cell(metadata_row.get("chamber"))
+    region = clean_cell(legislator_row.get("region"))
+    counties = clean_cell(metadata_row.get("counties"))
+    image_url = clean_cell(metadata_row.get("image_url"))
+
+    context = {
+        "legislator": legislator_name,
+        "party": party,
+        "district": district,
+        "chamber": chamber,
+        "region": region,
+        "counties": counties,
+        "image_url": image_url,
+        "party_color": extract_party_color(party),
+
+        "committee_relevance_html": rich_text_to_html(profile_row.get("committee_relevance", "")),
+        "time_in_office_html": rich_text_to_html(profile_row.get("time_in_office_summary", "") or profile_row.get("time_in_office", "")),
+        "biography_html": rich_text_to_html(profile_row.get("biography", "")),
+        "key_issues_html": rich_text_to_html(profile_row.get("key_issues", "")),
+        "district_signals_html": rich_text_to_html(profile_row.get("district_signals", "")),
+        "legislative_focus_html": rich_text_to_html(profile_row.get("legislative_focus", "")),
+        "key_bills_html": rich_text_to_html(profile_row.get("key_bills", "")),
+        "political_positioning_html": rich_text_to_html(profile_row.get("political_positioning", "")),
+        "sbdc_framing_html": rich_text_to_html(profile_row.get("sbdc_framing", "")),
+        "talking_points_html": rich_text_to_html(profile_row.get("talking_points", "")),
+
+        "committee_relevance_raw": clean_cell(profile_row.get("committee_relevance")),
+        "time_in_office_raw": clean_cell(profile_row.get("time_in_office_summary") or profile_row.get("time_in_office")),
+        "biography_raw": clean_cell(profile_row.get("biography")),
+        "key_issues_raw": clean_cell(profile_row.get("key_issues")),
+        "district_signals_raw": clean_cell(profile_row.get("district_signals")),
+        "legislative_focus_raw": clean_cell(profile_row.get("legislative_focus")),
+        "key_bills_raw": clean_cell(profile_row.get("key_bills")),
+        "political_positioning_raw": clean_cell(profile_row.get("political_positioning")),
+        "sbdc_framing_raw": clean_cell(profile_row.get("sbdc_framing")),
+        "talking_points_raw": clean_cell(profile_row.get("talking_points")),
+    }
+
+    return context
+
+
+def render_pdf(
+    env: Environment,
+    template_name: str,
+    context: Dict[str, Any],
+    output_path: Path,
+) -> None:
+    template = env.get_template(template_name)
+    html_content = template.render(**context)
+
+    # Optional CSS file if you have one
+    css_path = STATIC_DIR / "report.css"
+    stylesheets = [CSS(filename=str(css_path))] if css_path.exists() else []
+
+    HTML(string=html_content, base_url=str(TEMPLATE_DIR.resolve())).write_pdf(
+        str(output_path),
+        stylesheets=stylesheets,
     )
 
 
 # =========================
-# Load data
+# Main Generation Flow
 # =========================
-def load_legislators(service) -> Dict[str, Dict[str, str]]:
-    rows = sheets_get_values(service, LEGISLATORS_RANGE)
-    out = {}
 
-    for row in rows:
-        row = pad_row(row, 6)
-        legislator = row[0].strip()
-        if not legislator:
-            continue
+def find_processed_column_letter(profile_headers: List[str]) -> Optional[str]:
+    """
+    Best effort mapping if you later want to mark processed rows.
+    """
+    normalized = [normalize_header(h) for h in profile_headers]
+    try:
+        idx = normalized.index("processed")
+    except ValueError:
+        return None
 
-        out[legislator] = {
-            "Legislator": row[0].strip(),
-            "Website_URL": row[1].strip(),
-            "Region": row[2].strip(),
-            "Tier": row[3].strip(),
-            "Last_Checked": row[4].strip(),
-            "Hub_URL": row[5].strip(),
-        }
-
-    return out
+    # Convert 0-based index to Excel column letter
+    n = idx + 1
+    letters = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
 
 
-def load_metadata(service) -> Dict[str, Dict[str, str]]:
-    rows = sheets_get_values(service, METADATA_RANGE)
-    out = {}
+def get_raw_headers(service, spreadsheet_id: str, tab_name: str) -> List[str]:
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_name}!1:1"
+    ).execute()
 
-    for row in rows:
-        row = pad_row(row, 17)
-        legislator = row[0].strip()
-        if not legislator:
-            continue
-
-        out[legislator] = {
-            "Legislator": row[0].strip(),
-            "Chamber": row[1].strip(),
-            "District": row[2].strip(),
-            "Party": row[3].strip(),
-            "First_Elected_to_Current_Chamber": row[4].strip(),
-            "Current_Term_Start": row[5].strip(),
-            "Current_Term_End": row[6].strip(),
-            "Time_In_Office_Note": row[7].strip(),
-            "Education": row[8].strip(),
-            "Professional_Background": row[9].strip(),
-            "Government_Experience": row[10].strip(),
-            "Committee_Assignments": row[11].strip(),
-            "Key_Issues_Source": row[12].strip(),
-            "Political_Positioning_Source": row[13].strip(),
-            "Verification_Notes": row[14].strip(),
-            "Image_URL": row[15].strip(),
-            "Counties": row[16].strip(),
-        }
-
-    return out
+    values = result.get("values", [])
+    return values[0] if values else []
 
 
-def load_profiles(service) -> Dict[str, Dict[str, str]]:
-    rows = sheets_get_values(service, PROFILES_RANGE)
-    out = {}
-
-    for row in rows:
-        row = pad_row(row, 17)
-        legislator = row[0].strip()
-        if not legislator:
-            continue
-
-        if row[15].strip().upper() != "TRUE":
-            continue
-
-        out[legislator] = {
-            "Legislator": row[0].strip(),
-            "Committee_Relevance_Summary": row[1].strip(),
-            "Time_In_Office_Summary": row[2].strip(),
-            "Generated_Biography": row[3].strip(),
-            "Key_Issues": row[4].strip(),
-            "District_Development_Signals": row[5].strip(),
-            "Legislative_Focus_Areas": row[6].strip(),
-            "Key_Bills": row[7].strip(),
-            "Political_Positioning": row[8].strip(),
-            "Political_Positioning_Bullets": row[9].strip(),
-            "SBDC_Framing": row[10].strip(),
-            "Talking_Points": row[11].strip(),
-            "Bills_Analyzed_Count": row[12].strip(),
-            "Source_Bill_Numbers": row[13].strip(),
-            "Last_Updated": row[14].strip(),
-            "Profile_Processed": row[15].strip(),
-            "Notes": row[16].strip(),
-        }
-
-    return out
-
-
-# =========================
-# Rendering
-# =========================
-def render_html(row: Dict[str, str]) -> str:
-    env = Environment(loader=FileSystemLoader("templates"))
-    template = env.get_template("report.html")
-
-    chamber_label = row["Chamber"]
-    if chamber_label.lower() == "senate":
-        chamber_label = "Senate"
-    elif chamber_label.lower() == "house":
-        chamber_label = "House"
-
-    party_label = format_party_label(row["Party"])
-    region = row.get("Region", "").strip()
-    counties = format_counties_full(row.get("Counties", ""))
-
-    if region and counties:
-        location_line = f"{region} | {counties}"
-    elif region:
-        location_line = region
-    else:
-        location_line = counties
-
-    time_in_office_items = split_pipe(row["Time_In_Office_Summary"])
-    term_limit_note = build_term_limit_note(row)
-    if term_limit_note:
-        time_in_office_items.append(term_limit_note)
-
-    committee_items = [
-        (normalize_committee_name(name), note)
-        for name, note in parse_committee_items(row["Committee_Relevance_Summary"])
-    ]
-
-    return template.render(
-        name=row["Legislator"],
-        chamber=chamber_label,
-        district=row["District"],
-        party_label=party_label,
-        party_color=get_party_color(row["Party"]),
-        location_line=location_line,
-        image_url=row["Image_URL"],
-        committee_items=committee_items,
-        time_in_office=time_in_office_items,
-        bio=parse_biography_items(row["Generated_Biography"]),
-        issues=parse_labeled_items(row["Key_Issues"]),
-        district_signals=split_pipe(row["District_Development_Signals"]),
-        focus=split_pipe(row["Legislative_Focus_Areas"]),
-        bills=split_key_bills(row["Key_Bills"]),
-        positioning=row["Political_Positioning"],
-        positioning_notes=split_pipe(row["Political_Positioning_Bullets"]),
-        sbdc=row["SBDC_Framing"],
-        talking=split_pipe(row["Talking_Points"]),
-    )
-
-
-def write_pdf(html_string: str, output_path: str) -> None:
-    HTML(string=html_string).write_pdf(output_path)
-
-
-# =========================
-# Main
-# =========================
 def main():
+    ensure_dir(OUTPUT_DIR)
+
+    print("Building Google API clients...")
     sheets_service = get_sheets_service()
+    drive_service = get_drive_service()
 
-    legislators_by_name = load_legislators(sheets_service)
-    metadata_by_name = load_metadata(sheets_service)
-    profiles_by_name = load_profiles(sheets_service)
+    print("Reading sheet data...")
+    legislators_rows = read_sheet_as_dicts(sheets_service, SHEET_ID, TAB_LEGISLATORS)
+    metadata_rows = read_sheet_as_dicts(sheets_service, SHEET_ID, TAB_METADATA)
+    profile_rows = read_sheet_with_row_numbers(sheets_service, SHEET_ID, TAB_PROFILES)
 
-    legislators = sorted(
-        set(legislators_by_name.keys()) &
-        set(metadata_by_name.keys()) &
-        set(profiles_by_name.keys())
-    )
+    if not legislators_rows:
+        raise RuntimeError(f"No rows found in tab '{TAB_LEGISLATORS}'")
+    if not metadata_rows:
+        raise RuntimeError(f"No rows found in tab '{TAB_METADATA}'")
+    if not profile_rows:
+        raise RuntimeError(f"No rows found in tab '{TAB_PROFILES}'")
 
-    if ONLY_LEGISLATOR:
-        legislators = [x for x in legislators if x == ONLY_LEGISLATOR]
+    legislators_index = build_index(legislators_rows, ["legislator", "name"])
+    metadata_index = build_index(metadata_rows, ["legislator", "name"])
 
-    print(f"Generating reports for {len(legislators)} legislator(s)...")
+    raw_profile_headers = get_raw_headers(sheets_service, SHEET_ID, TAB_PROFILES)
+    processed_col_letter = find_processed_column_letter(raw_profile_headers)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    env = load_template_env(TEMPLATE_DIR)
 
     generated_count = 0
-    skipped_count = 0
+    uploaded_count = 0
 
-    for legislator in legislators:
-        merged = {}
-        merged.update(legislators_by_name[legislator])
-        merged.update(metadata_by_name[legislator])
-        merged.update(profiles_by_name[legislator])
-
-        if not merged.get("Image_URL"):
-            print(f"Skipping {legislator}: missing Image_URL in Legislator_Metadata.")
-            skipped_count += 1
+    for profile_row in profile_rows:
+        legislator_name = clean_cell(profile_row.get("legislator") or profile_row.get("name"))
+        if not legislator_name:
+            print("Skipping profile row with no legislator name.")
             continue
 
-        html = render_html(merged)
+        if ONLY_LEGISLATOR and legislator_name.lower() != ONLY_LEGISLATOR.lower():
+            continue
 
-        slug = slugify(legislator)
-        filename = f"{slug}.pdf"
-        output_path = os.path.join(OUTPUT_DIR, filename)
+        if ONLY_PROCESSED_PROFILES and not bool_from_cell(profile_row.get("processed")):
+            print(f"Skipping unprocessed profile: {legislator_name}")
+            continue
 
-        write_pdf(html, output_path)
-        print(f"Generated report for {legislator}: {output_path}")
+        legislator_row = legislators_index.get(legislator_name.lower(), {})
+        metadata_row = metadata_index.get(legislator_name.lower(), {})
+
+        if not metadata_row:
+            print(f"Warning: No metadata row found for {legislator_name}. Continuing with partial data.")
+
+        context = prepare_report_context(legislator_row, metadata_row, profile_row)
+
+        safe_name = slugify_filename(legislator_name)
+        filename = f"{safe_name}_briefing.pdf"
+        output_path = OUTPUT_DIR / filename
+
+        print(f"Generating PDF for {legislator_name} -> {output_path}")
+        render_pdf(env, TEMPLATE_NAME, context, output_path)
         generated_count += 1
 
-    print(f"Done. Generated={generated_count}, Skipped={skipped_count}")
+        try:
+            uploaded = upload_pdf_to_drive(
+                drive_service=drive_service,
+                pdf_path=output_path,
+                folder_id=DRIVE_REPORTS_FOLDER_ID,
+                overwrite_existing=OVERWRITE_EXISTING_IN_TARGET_FOLDER,
+            )
+            uploaded_count += 1
+
+            if MARK_PROFILES_PROCESSED and processed_col_letter:
+                row_number = profile_row["_sheet_row_number"]
+                cell_ref = f"{processed_col_letter}{row_number}"
+                update_cell(sheets_service, SHEET_ID, TAB_PROFILES, cell_ref, "TRUE")
+
+            print(f"Drive link: {uploaded.get('webViewLink', 'No link returned')}")
+
+        except HttpError as e:
+            print(f"Drive upload failed for {legislator_name}: {e}")
+            # Keep local PDF even if upload fails
+
+    print("Done.")
+    print(f"Generated PDFs: {generated_count}")
+    print(f"Uploaded PDFs:  {uploaded_count}")
 
 
 if __name__ == "__main__":
