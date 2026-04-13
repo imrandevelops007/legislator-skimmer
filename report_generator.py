@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 from jinja2 import Environment, FileSystemLoader
 from weasyprint import HTML
 
@@ -394,20 +395,37 @@ def list_existing_files_in_target_folder(drive_service, folder_id: str, filename
     return response.get("files", [])
 
 
-def delete_existing_files_in_target_folder(drive_service, folder_id: str, filename: str) -> None:
-    existing_files = list_existing_files_in_target_folder(drive_service, folder_id, filename)
-    for existing in existing_files:
-        print(f"Deleting existing Drive file in target folder: {existing['name']} ({existing['id']})")
-        (
-            drive_service.files()
-            .delete(fileId=existing["id"], supportsAllDrives=True)
-            .execute()
-        )
-
-
 def upload_pdf_to_drive(drive_service, local_path: str, filename: str, folder_id: str) -> str:
-    if OVERWRITE_EXISTING_IN_TARGET_FOLDER:
-        delete_existing_files_in_target_folder(drive_service, folder_id, filename)
+    existing_files = list_existing_files_in_target_folder(drive_service, folder_id, filename)
+
+    if OVERWRITE_EXISTING_IN_TARGET_FOLDER and existing_files:
+        existing = existing_files[0]
+        file_id = existing["id"]
+        print(f"Updating existing Drive file in target folder: {existing['name']} ({file_id})")
+
+        try:
+            media = MediaFileUpload(local_path, mimetype="application/pdf", resumable=True)
+
+            updated = (
+                drive_service.files()
+                .update(
+                    fileId=file_id,
+                    media_body=media,
+                    fields="id, name, webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+            print(f"Updated in Drive: {updated['name']} ({updated['id']})")
+            return updated.get("webViewLink", "")
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+
+            if status != 404:
+                raise
+
+            print(f"Existing file could not be updated because it was not found anymore: {file_id}")
+            print("Falling back to fresh upload...")
 
     file_metadata = {
         "name": filename,
