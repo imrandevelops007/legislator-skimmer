@@ -37,7 +37,6 @@ TAB_PROFILES = os.getenv("TAB_PROFILES", "Profiles_Dynamic")
 
 ONLY_PROCESSED_PROFILES = os.getenv("ONLY_PROCESSED_PROFILES", "true").strip().lower() == "true"
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
-MARK_PROFILES_PROCESSED = os.getenv("MARK_PROFILES_PROCESSED", "false").strip().lower() == "true"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -70,10 +69,15 @@ def clean_cell(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
-def split_lines(value: str) -> List[str]:
-    if not value:
+def split_lines(value: Any) -> List[str]:
+    text = clean_cell(value)
+    if not text:
         return []
-    return [line.strip("• ").strip() for line in str(value).splitlines() if line.strip()]
+    return [line.strip("• ").strip() for line in text.splitlines() if line.strip()]
+
+
+def multiline_text(value: Any) -> str:
+    return "\n".join(split_lines(value))
 
 
 def bullets_to_html(items: List[str]) -> str:
@@ -83,7 +87,7 @@ def bullets_to_html(items: List[str]) -> str:
     return f"<ul>{lis}</ul>"
 
 
-def rich_text_to_html(value: str) -> str:
+def rich_text_to_html(value: Any) -> str:
     return bullets_to_html(split_lines(value))
 
 
@@ -98,6 +102,38 @@ def extract_party_color(party: str) -> str:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def require_profile_columns(profile_rows: List[Dict[str, Any]]) -> None:
+    required = {
+        "legislator",
+        "committee_relevance_summary",
+        "time_in_office_summary",
+        "generated_biography",
+        "key_issues",
+        "district_development_signals",
+        "legislative_focus_areas",
+        "key_bills",
+        "political_positioning",
+        "political_positioning_bullets",
+        "sbdc_framing",
+        "talking_points",
+        "bills_analyzed_count",
+        "source_bill_numbers",
+        "last_updated",
+        "profile_processed",
+        "notes",
+    }
+
+    if not profile_rows:
+        raise RuntimeError(f"No rows found in tab '{TAB_PROFILES}'")
+
+    available = set(profile_rows[0].keys())
+    missing = sorted(col for col in required if col not in available)
+    if missing:
+        raise RuntimeError(
+            f"Profiles_Dynamic is missing required column(s): {', '.join(missing)}"
+        )
 
 
 # =========================
@@ -143,37 +179,6 @@ def read_sheet_as_dicts(service, spreadsheet_id: str, tab_name: str) -> List[Dic
     return rows
 
 
-def read_sheet_with_row_numbers(service, spreadsheet_id: str, tab_name: str) -> List[Dict[str, Any]]:
-    result = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=tab_name
-    ).execute()
-
-    values = result.get("values", [])
-    if not values:
-        return []
-
-    headers = [normalize_header(h) for h in values[0]]
-    rows = []
-
-    for i, row in enumerate(values[1:], start=2):
-        padded = row + [""] * (len(headers) - len(row))
-        item = {headers[j]: padded[j] for j in range(len(headers))}
-        item["_sheet_row_number"] = i
-        rows.append(item)
-
-    return rows
-
-
-def update_cell(service, spreadsheet_id: str, tab_name: str, a1_range: str, value: str) -> None:
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_name}!{a1_range}",
-        valueInputOption="RAW",
-        body={"values": [[value]]},
-    ).execute()
-
-
 def build_index(rows: List[Dict[str, Any]], key_candidates: List[str]) -> Dict[str, Dict[str, Any]]:
     index = {}
     for row in rows:
@@ -185,34 +190,6 @@ def build_index(rows: List[Dict[str, Any]], key_candidates: List[str]) -> Dict[s
         if key:
             index[key.lower()] = row
     return index
-
-
-def get_raw_headers(service, spreadsheet_id: str, tab_name: str) -> List[str]:
-    result = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_name}!1:1"
-    ).execute()
-
-    values = result.get("values", [])
-    return values[0] if values else []
-
-
-def find_profile_processed_column_letter(profile_headers: List[str]) -> Optional[str]:
-    normalized = [normalize_header(h) for h in profile_headers]
-
-    for candidate in ["profile_processed", "processed"]:
-        if candidate in normalized:
-            idx = normalized.index(candidate)
-            break
-    else:
-        return None
-
-    n = idx + 1
-    letters = ""
-    while n:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
 
 
 # =========================
@@ -295,13 +272,7 @@ def prepare_report_context(
     metadata_row: Dict[str, Any],
     profile_row: Dict[str, Any],
 ) -> Dict[str, Any]:
-    legislator_name = clean_cell(
-        profile_row.get("legislator")
-        or metadata_row.get("legislator")
-        or legislator_row.get("legislator")
-        or legislator_row.get("name")
-    )
-
+    legislator_name = clean_cell(profile_row["legislator"])
     party = clean_cell(metadata_row.get("party"))
     district = clean_cell(metadata_row.get("district"))
     chamber = clean_cell(metadata_row.get("chamber"))
@@ -309,19 +280,15 @@ def prepare_report_context(
     counties = clean_cell(metadata_row.get("counties"))
     image_url = clean_cell(metadata_row.get("image_url"))
 
-    political_positioning_main = clean_cell(profile_row.get("political_positioning"))
-    political_positioning_bullets = clean_cell(profile_row.get("political_positioning_bullets"))
-
     political_positioning_combined = "\n".join(
-        part for part in [political_positioning_main, political_positioning_bullets] if part
+        part for part in [
+            multiline_text(profile_row["political_positioning"]),
+            multiline_text(profile_row["political_positioning_bullets"]),
+        ] if part
     )
 
-    bills_analyzed_count = clean_cell(profile_row.get("bills_analyzed_count"))
-    source_bill_numbers = clean_cell(profile_row.get("source_bill_numbers"))
-    last_updated = clean_cell(profile_row.get("last_updated"))
-    notes = clean_cell(profile_row.get("notes"))
-
     context = {
+        # Identity / header
         "legislator": legislator_name,
         "party": party,
         "district": district,
@@ -331,32 +298,42 @@ def prepare_report_context(
         "image_url": image_url,
         "party_color": extract_party_color(party),
 
-        "committee_relevance_html": rich_text_to_html(profile_row.get("committee_relevance_summary", "")),
-        "time_in_office_html": rich_text_to_html(profile_row.get("time_in_office_summary", "")),
-        "biography_html": rich_text_to_html(profile_row.get("generated_biography", "")),
-        "key_issues_html": rich_text_to_html(profile_row.get("key_issues", "")),
-        "district_signals_html": rich_text_to_html(profile_row.get("district_development_signals", "")),
-        "legislative_focus_html": rich_text_to_html(profile_row.get("legislative_focus_areas", "")),
-        "key_bills_html": rich_text_to_html(profile_row.get("key_bills", "")),
-        "political_positioning_html": rich_text_to_html(political_positioning_combined),
-        "sbdc_framing_html": rich_text_to_html(profile_row.get("sbdc_framing", "")),
-        "talking_points_html": rich_text_to_html(profile_row.get("talking_points", "")),
+        # Plain text fields for template
+        "committee_relevance": multiline_text(profile_row["committee_relevance_summary"]),
+        "time_in_office": multiline_text(profile_row["time_in_office_summary"]),
+        "biography": multiline_text(profile_row["generated_biography"]),
+        "key_issues": multiline_text(profile_row["key_issues"]),
+        "district_signals": multiline_text(profile_row["district_development_signals"]),
+        "legislative_focus": multiline_text(profile_row["legislative_focus_areas"]),
+        "key_bills": multiline_text(profile_row["key_bills"]),
+        "political_positioning": political_positioning_combined,
+        "sbdc_framing": multiline_text(profile_row["sbdc_framing"]),
+        "talking_points": multiline_text(profile_row["talking_points"]),
 
-        "committee_relevance_raw": clean_cell(profile_row.get("committee_relevance_summary")),
-        "time_in_office_raw": clean_cell(profile_row.get("time_in_office_summary")),
-        "biography_raw": clean_cell(profile_row.get("generated_biography")),
-        "key_issues_raw": clean_cell(profile_row.get("key_issues")),
-        "district_signals_raw": clean_cell(profile_row.get("district_development_signals")),
-        "legislative_focus_raw": clean_cell(profile_row.get("legislative_focus_areas")),
-        "key_bills_raw": clean_cell(profile_row.get("key_bills")),
-        "political_positioning_raw": political_positioning_combined,
-        "sbdc_framing_raw": clean_cell(profile_row.get("sbdc_framing")),
-        "talking_points_raw": clean_cell(profile_row.get("talking_points")),
+        # HTML fields if template uses them
+        "committee_relevance_html": rich_text_to_html(profile_row["committee_relevance_summary"]),
+        "time_in_office_html": rich_text_to_html(profile_row["time_in_office_summary"]),
+        "biography_html": rich_text_to_html(profile_row["generated_biography"]),
+        "key_issues_html": rich_text_to_html(profile_row["key_issues"]),
+        "district_signals_html": rich_text_to_html(profile_row["district_development_signals"]),
+        "legislative_focus_html": rich_text_to_html(profile_row["legislative_focus_areas"]),
+        "key_bills_html": rich_text_to_html(profile_row["key_bills"]),
+        "political_positioning_html": rich_text_to_html(
+            "\n".join(
+                part for part in [
+                    clean_cell(profile_row["political_positioning"]),
+                    clean_cell(profile_row["political_positioning_bullets"]),
+                ] if part
+            )
+        ),
+        "sbdc_framing_html": rich_text_to_html(profile_row["sbdc_framing"]),
+        "talking_points_html": rich_text_to_html(profile_row["talking_points"]),
 
-        "bills_analyzed_count": bills_analyzed_count,
-        "source_bill_numbers": source_bill_numbers,
-        "last_updated": last_updated,
-        "notes": notes,
+        # Extra metadata
+        "bills_analyzed_count": clean_cell(profile_row["bills_analyzed_count"]),
+        "source_bill_numbers": clean_cell(profile_row["source_bill_numbers"]),
+        "last_updated": clean_cell(profile_row["last_updated"]),
+        "notes": clean_cell(profile_row["notes"]),
     }
 
     return context
@@ -381,7 +358,7 @@ def render_pdf(
 
 
 # =========================
-# Main Generation Flow
+# Main
 # =========================
 
 def main():
@@ -394,7 +371,7 @@ def main():
     print("Reading sheet data...")
     legislators_rows = read_sheet_as_dicts(sheets_service, SHEET_ID, TAB_LEGISLATORS)
     metadata_rows = read_sheet_as_dicts(sheets_service, SHEET_ID, TAB_METADATA)
-    profile_rows = read_sheet_with_row_numbers(sheets_service, SHEET_ID, TAB_PROFILES)
+    profile_rows = read_sheet_as_dicts(sheets_service, SHEET_ID, TAB_PROFILES)
 
     if not legislators_rows:
         raise RuntimeError(f"No rows found in tab '{TAB_LEGISLATORS}'")
@@ -403,19 +380,17 @@ def main():
     if not profile_rows:
         raise RuntimeError(f"No rows found in tab '{TAB_PROFILES}'")
 
+    require_profile_columns(profile_rows)
+
     legislators_index = build_index(legislators_rows, ["legislator", "name"])
     metadata_index = build_index(metadata_rows, ["legislator", "name"])
-
-    raw_profile_headers = get_raw_headers(sheets_service, SHEET_ID, TAB_PROFILES)
-    processed_col_letter = find_profile_processed_column_letter(raw_profile_headers)
-
     env = load_template_env(TEMPLATE_DIR)
 
     generated_count = 0
     uploaded_count = 0
 
     for profile_row in profile_rows:
-        legislator_name = clean_cell(profile_row.get("legislator") or profile_row.get("name"))
+        legislator_name = clean_cell(profile_row["legislator"])
         if not legislator_name:
             print("Skipping profile row with no legislator name.")
             continue
@@ -423,13 +398,7 @@ def main():
         if ONLY_LEGISLATOR and legislator_name.lower() != ONLY_LEGISLATOR.lower():
             continue
 
-        profile_processed = (
-            profile_row.get("profile_processed")
-            or profile_row.get("processed")
-            or ""
-        )
-
-        if ONLY_PROCESSED_PROFILES and not bool_from_cell(profile_processed):
+        if ONLY_PROCESSED_PROFILES and not bool_from_cell(profile_row["profile_processed"]):
             print(f"Skipping unprocessed profile: {legislator_name}")
             continue
 
@@ -441,8 +410,7 @@ def main():
 
         context = prepare_report_context(legislator_row, metadata_row, profile_row)
 
-        safe_name = slugify_filename(legislator_name)
-        filename = f"{safe_name}_briefing.pdf"
+        filename = f"{slugify_filename(legislator_name)}.pdf"
         output_path = OUTPUT_DIR / filename
 
         print(f"Generating PDF for {legislator_name} -> {output_path}")
@@ -457,14 +425,7 @@ def main():
                 overwrite_existing=OVERWRITE_EXISTING_IN_TARGET_FOLDER,
             )
             uploaded_count += 1
-
-            if MARK_PROFILES_PROCESSED and processed_col_letter:
-                row_number = profile_row["_sheet_row_number"]
-                cell_ref = f"{processed_col_letter}{row_number}"
-                update_cell(sheets_service, SHEET_ID, TAB_PROFILES, cell_ref, "TRUE")
-
             print(f"Drive link: {uploaded.get('webViewLink', 'No link returned')}")
-
         except HttpError as e:
             print(f"Drive upload failed for {legislator_name}: {e}")
 
