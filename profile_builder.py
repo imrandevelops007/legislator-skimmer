@@ -320,14 +320,23 @@ def main():
         if clean(row.get("Legislator", ""))
     }
 
-    legislators_to_evaluate = []
-    for row in legislators_rows:
+    if ONLY_LEGISLATOR:
+        legislators_to_evaluate = [ONLY_LEGISLATOR]
+    else:
+        legislators_to_evaluate = []
+        seen = set()
+
+    for row in profiles_rows:
         legislator = clean(row.get("Legislator", ""))
-        if not legislator:
+        if not legislator or legislator in seen:
             continue
-        if ONLY_LEGISLATOR and legislator != ONLY_LEGISLATOR:
-            continue
-        legislators_to_evaluate.append(legislator)
+
+        profile_processed = bool_from_cell(row.get("Profile_Processed", ""))
+        needs_rebuild = bool_from_cell(row.get("Needs_Rebuild", ""))
+
+        if (not profile_processed) or needs_rebuild:
+            legislators_to_evaluate.append(legislator)
+            seen.add(legislator)
 
     print(f"Legislators to evaluate: {len(legislators_to_evaluate)}")
 
