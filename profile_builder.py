@@ -39,6 +39,20 @@ ACTIVITY_RANGE = f"{ACTIVITY_TAB}!A1:I"
 METADATA_RANGE = f"{METADATA_TAB}!A1:Z"
 PROFILES_RANGE = f"{PROFILES_TAB}!A1:R"
 
+PROFILE_OUTPUT_FIELDS = [
+    "Committee_Relevance_Summary",
+    "Time_In_Office_Summary",
+    "Generated_Biography",
+    "Key_Issues",
+    "District_Development_Signals",
+    "Legislative_Focus_Areas",
+    "Key_Bills",
+    "Political_Positioning",
+    "Political_Positioning_Bullets",
+    "SBDC_Framing",
+    "Talking_Points",
+]
+
 
 # =========================
 # Helpers
@@ -155,7 +169,6 @@ def item_priority(item: Dict[str, str]) -> Tuple[int, int]:
     bill_number = clean(item.get("Bill Number", ""))
     prefix = normalize_bill_prefix(bill_number)
 
-    # lower number = higher priority
     if prefix in {"HB", "SB"}:
         tier = 1
     elif prefix in {"HJR", "SJR"}:
@@ -165,7 +178,6 @@ def item_priority(item: Dict[str, str]) -> Tuple[int, int]:
     else:
         tier = 4
 
-    # prefer rows that actually have a bill number and title
     detail_bonus = 0
     if clean(item.get("Bill Title", "")):
         detail_bonus -= 1
@@ -231,6 +243,9 @@ Requirements:
 - Avoid redundancy across sections.
 - If legislative activity is mostly resolutions or joint resolutions, still generate a useful profile from those signals.
 - Prioritize substantive work when present, but do not refuse to build a profile if only lower-signal legislative activity is available.
+- Do not claim certainty beyond the provided data.
+- Keep talking points strategic, not scripted.
+- Keep political positioning concise and evidence-based.
 
 Return valid JSON only with this exact shape:
 {{
@@ -277,7 +292,8 @@ def call_gemini_with_retry(client, prompt: str) -> Dict[str, str]:
                 text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE).strip()
                 text = re.sub(r"```$", "", text.strip()).strip()
 
-            return json.loads(text)
+            parsed = json.loads(text)
+            return {field: clean(parsed.get(field, "")) for field in PROFILE_OUTPUT_FIELDS}
 
         except Exception as e:
             last_error = str(e)
@@ -320,23 +336,24 @@ def main():
         if clean(row.get("Legislator", ""))
     }
 
+    legislators_to_evaluate: List[str] = []
+
     if ONLY_LEGISLATOR:
         legislators_to_evaluate = [ONLY_LEGISLATOR]
     else:
-        legislators_to_evaluate = []
         seen = set()
 
-    for row in profiles_rows:
-        legislator = clean(row.get("Legislator", ""))
-        if not legislator or legislator in seen:
-            continue
+        for row in profiles_rows:
+            legislator = clean(row.get("Legislator", ""))
+            if not legislator or legislator in seen:
+                continue
 
-        profile_processed = bool_from_cell(row.get("Profile_Processed", ""))
-        needs_rebuild = bool_from_cell(row.get("Needs_Rebuild", ""))
+            profile_processed = bool_from_cell(row.get("Profile_Processed", ""))
+            needs_rebuild = bool_from_cell(row.get("Needs_Rebuild", ""))
 
-        if (not profile_processed) or needs_rebuild:
-            legislators_to_evaluate.append(legislator)
-            seen.add(legislator)
+            if (not profile_processed) or needs_rebuild:
+                legislators_to_evaluate.append(legislator)
+                seen.add(legislator)
 
     print(f"Legislators to evaluate: {len(legislators_to_evaluate)}")
 
@@ -371,7 +388,6 @@ def main():
             continue
 
         selected_items = select_best_items(processed_items, MAX_BILLS_PER_LEGISLATOR)
-
         metadata = metadata_by_legislator.get(legislator, {})
         prompt = build_profile_prompt(legislator, metadata, selected_items)
 
