@@ -47,15 +47,16 @@ jobs:
           ONLY_LEGISLATOR: "Nancy Jenkins-Arno"
         run: |
           python analyze.py
-
+          
       - name: Run profile builder
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: "gemini-2.5-flash"
-          MAX_BILLS_PER_LEGISLATOR: "8"
+          MAX_BILLS_PER_LEGISLATOR: "12"
           MIN_SUBSTANTIVE_BILLS_REQUIRED: "4"
+          MIN_TOTAL_ITEMS_REQUIRED: "6"
           PROFILE_MAX_RETRIES: "2"
           PROFILE_REQUEST_DELAY_SECONDS: "5"
           STOP_ON_QUOTA_EXHAUSTION: "true"
