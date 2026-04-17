@@ -2,11 +2,10 @@ import os
 import json
 import re
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from google import genai
@@ -20,7 +19,7 @@ DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
 SHEET_ID = os.environ["SHEET_ID"]
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -32,30 +31,42 @@ GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "7"))
 STOP_ON_QUOTA_EXHAUSTION = os.getenv("STOP_ON_QUOTA_EXHAUSTION", "true").strip().lower() == "true"
 
-ACTIVITY_RANGE = os.getenv("ACTIVITY_RANGE", "Activity_Items!A2:I")
-PROFILES_TAB = os.getenv("PROFILES_TAB", "Profiles_Dynamic")
+ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
-# Assumed Activity_Items columns:
-# A URL
-# B Legislator
-# C Type
-# D Timestamp
-# E Bill Number
-# F Bill Title
-# G Bill Summary
-# H Processed
-# I Notes
+ACTIVITY_TAB = "Activity_Items"
+ACTIVITY_RANGE = f"{ACTIVITY_TAB}!A2:H"
+PROFILES_TAB = "Profiles_Dynamic"
 
-ACTIVITY_HEADERS = [
+EXPECTED_ACTIVITY_HEADERS = [
     "URL",
     "Legislator",
     "Type",
     "Timestamp",
-    "Bill_Number",
-    "Bill_Title",
-    "Bill_Summary",
+    "Bill Number",
+    "Bill Title",
+    "Bill Summary",
     "Processed",
+]
+
+EXPECTED_PROFILES_HEADERS = [
+    "Legislator",
+    "Committee_Relevance_Summary",
+    "Time_In_Office_Summary",
+    "Generated_Biography",
+    "Key_Issues",
+    "District_Development_Signals",
+    "Legislative_Focus_Areas",
+    "Key_Bills",
+    "Political_Positioning",
+    "Political_Positioning_Bullets",
+    "SBDC_Framing",
+    "Talking_Points",
+    "Bills_Analyzed_Count",
+    "Source_Bill_Numbers",
+    "Last_Updated",
+    "Profile_Processed",
     "Notes",
+    "Needs_Rebuild",
 ]
 
 
@@ -68,11 +79,7 @@ def clean(value: Any) -> str:
 
 
 def bool_from_cell(value: Any) -> bool:
-    return clean(value).lower() in {"true", "yes", "1", "y"}
-
-
-def normalize_header(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_")
+    return clean(value).lower() in {"true", "1", "yes", "y"}
 
 
 def looks_like_quota_error(text: str) -> bool:
@@ -90,27 +97,22 @@ def looks_like_unavailable_error(text: str) -> bool:
     return "503" in t or "unavailable" in t or "high demand" in t
 
 
-def chunk_text(text: str, limit: int) -> str:
-    return clean(text)[:limit]
+def pad_row(row: List[str], length: int) -> List[str]:
+    if len(row) < length:
+        row = row + [""] * (length - len(row))
+    return row[:length]
 
 
-def extract_page_text(url: str) -> str:
-    resp = requests.get(url, timeout=25)
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    return chunk_text(text, MAX_PAGE_CHARS)
+def get_col_index(headers: List[str], name: str) -> int:
+    try:
+        return headers.index(name)
+    except ValueError:
+        raise RuntimeError(f"Missing required column: {name}")
 
 
-def parse_json_response(text: str) -> Dict[str, Any]:
-    text = clean(text)
-
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE).strip()
-        text = re.sub(r"```$", "", text.strip()).strip()
-
-    return json.loads(text)
+def now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 # =========================
@@ -134,7 +136,7 @@ def get_gemini_client():
 # Sheets helpers
 # =========================
 
-def sheets_get_values(service, rng: str) -> List[List[str]]:
+def sheets_get(service, rng: str) -> List[List[str]]:
     return (
         service.spreadsheets()
         .values()
@@ -144,7 +146,7 @@ def sheets_get_values(service, rng: str) -> List[List[str]]:
     )
 
 
-def sheets_update_range(service, rng: str, values: List[List[str]]) -> None:
+def sheets_update(service, rng: str, values: List[List[str]]) -> None:
     (
         service.spreadsheets()
         .values()
@@ -167,155 +169,66 @@ def sheets_batch_update(service, data: List[Dict[str, Any]]) -> None:
         .values()
         .batchUpdate(
             spreadsheetId=SHEET_ID,
-            body={
-                "valueInputOption": "RAW",
-                "data": data,
-            },
+            body={"valueInputOption": "RAW", "data": data},
         )
         .execute()
     )
 
 
-def column_letter_from_index(index_1_based: int) -> str:
-    result = ""
-    while index_1_based > 0:
-        index_1_based, rem = divmod(index_1_based - 1, 26)
-        result = chr(65 + rem) + result
-    return result
+# =========================
+# Content extraction
+# =========================
 
+def fetch_page_text(url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+        )
+    }
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
 
-def get_tab_rows_with_headers(service, tab_name: str) -> Tuple[List[str], List[Dict[str, Any]]]:
-    values = sheets_get_values(service, tab_name)
-    if not values:
-        return [], []
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    raw_headers = values[0]
-    norm_headers = [normalize_header(h) for h in raw_headers]
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
 
-    rows = []
-    for row_num, row in enumerate(values[1:], start=2):
-        padded = row + [""] * (len(raw_headers) - len(row))
-        item = {norm_headers[i]: padded[i] for i in range(len(raw_headers))}
-        item["_row_number"] = row_num
-        rows.append(item)
-
-    return raw_headers, rows
-
-
-def make_header_index(raw_headers: List[str]) -> Dict[str, int]:
-    return {normalize_header(h): i + 1 for i, h in enumerate(raw_headers)}
-
-
-def find_profile_row_for_legislator(profile_rows: List[Dict[str, Any]], legislator: str) -> Optional[Dict[str, Any]]:
-    target = clean(legislator).lower()
-    for row in profile_rows:
-        if clean(row.get("legislator")).lower() == target:
-            return row
-    return None
-
-
-def ensure_profiles_has_needs_rebuild(service) -> Tuple[List[str], Dict[str, int], List[Dict[str, Any]]]:
-    raw_headers, rows = get_tab_rows_with_headers(service, PROFILES_TAB)
-
-    if not raw_headers:
-        raise RuntimeError(f"{PROFILES_TAB} is missing or empty. It must already exist with headers.")
-
-    if "needs_rebuild" not in [normalize_header(h) for h in raw_headers]:
-        updated_headers = raw_headers + ["Needs_Rebuild"]
-        sheets_update_range(service, f"{PROFILES_TAB}!1:1", [updated_headers])
-        raw_headers, rows = get_tab_rows_with_headers(service, PROFILES_TAB)
-
-    return raw_headers, make_header_index(raw_headers), rows
-
-
-def mark_legislator_needs_rebuild(
-    service,
-    legislator: str,
-    profile_rows: List[Dict[str, Any]],
-    profile_header_index: Dict[str, int],
-) -> None:
-    row = find_profile_row_for_legislator(profile_rows, legislator)
-    if not row:
-        return
-
-    if "needs_rebuild" not in profile_header_index:
-        return
-
-    col_letter = column_letter_from_index(profile_header_index["needs_rebuild"])
-    row_number = row["_row_number"]
-
-    sheets_update_range(service, f"{PROFILES_TAB}!{col_letter}{row_number}", [["TRUE"]])
+    text = soup.get_text("\n", strip=True)
+    text = re.sub(r"\n{2,}", "\n\n", text).strip()
+    return text[:MAX_PAGE_CHARS]
 
 
 # =========================
-# Activity loading
+# Gemini
 # =========================
 
-def load_activity_rows(service) -> List[Dict[str, Any]]:
-    rows = sheets_get_values(service, ACTIVITY_RANGE)
-    out = []
-
-    for idx, row in enumerate(rows, start=2):
-        row = row + [""] * (len(ACTIVITY_HEADERS) - len(row))
-        item = {ACTIVITY_HEADERS[i]: row[i] for i in range(len(ACTIVITY_HEADERS))}
-        item["_row_number"] = idx
-        out.append(item)
-
-    return out
-
-
-def eligible_activity_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    eligible = []
-    for row in rows:
-        if bool_from_cell(row.get("Processed")):
-            continue
-        if clean(row.get("Type")).lower() != "bill":
-            continue
-        eligible.append(row)
-    return eligible
-
-
-# =========================
-# Gemini prompt
-# =========================
-
-def build_prompt(row: Dict[str, Any], page_text: str) -> str:
-    legislator = clean(row.get("Legislator"))
-    url = clean(row.get("URL"))
-    bill_number = clean(row.get("Bill_Number"))
-
+def build_prompt(page_text: str, url: str) -> str:
     return f"""
-You are extracting structured bill information for a Michigan legislative intelligence system.
+You are analyzing a Michigan legislative item page.
 
-Return valid JSON only.
-No markdown.
-No code fences.
+Your job:
+1. Determine a clean bill title.
+2. Produce a concise factual summary in 2-4 sentences.
+3. Do not add speculation.
+4. If the content is weak or ceremonial, still summarize it accurately.
+5. Return valid JSON only.
 
-Use this shape:
+JSON format:
 {{
-  "bill_number": "...",
-  "bill_title": "...",
-  "bill_summary": "..."
+  "title": "...",
+  "summary": "..."
 }}
 
-Rules:
-- bill_number should be the formal bill number if available, like HB 4001 or SB 12
-- bill_title should be concise and cleaned
-- bill_summary should be 1 to 3 sentences, factual, and useful for policy briefing
-- do not invent facts
-- if the bill number is already known, preserve it unless page text clearly shows a better formatted version
-
-Context:
-Legislator: {legislator}
-Known bill number: {bill_number}
-URL: {url}
+URL:
+{url}
 
 Page text:
 {page_text}
 """.strip()
 
 
-def call_gemini_with_retries(client, prompt: str) -> str:
+def call_gemini_with_retry(client, prompt: str) -> Dict[str, str]:
     last_error = None
 
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
@@ -325,20 +238,24 @@ def call_gemini_with_retries(client, prompt: str) -> str:
                 contents=prompt,
             )
             text = clean(getattr(response, "text", ""))
-            if not text:
-                raise RuntimeError("Gemini returned empty text.")
-            return text
+
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE).strip()
+                text = re.sub(r"```$", "", text.strip()).strip()
+
+            parsed = json.loads(text)
+            return {
+                "title": clean(parsed.get("title")),
+                "summary": clean(parsed.get("summary")),
+            }
 
         except Exception as e:
-            error_text = str(e)
-            last_error = e
+            last_error = str(e)
 
-            if looks_like_unavailable_error(error_text):
+            if looks_like_unavailable_error(last_error):
                 print(f"Gemini temporarily unavailable (attempt {attempt}/{GEMINI_MAX_RETRIES}).")
-            elif looks_like_quota_error(error_text):
-                print(f"Gemini quota/rate limit hit (attempt {attempt}/{GEMINI_MAX_RETRIES}).")
             else:
-                print(f"Gemini failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {error_text}")
+                print(f"Gemini failed attempt {attempt}/{GEMINI_MAX_RETRIES}: {last_error}")
 
             if attempt < GEMINI_MAX_RETRIES:
                 wait_seconds = REQUEST_DELAY_SECONDS + 1
@@ -346,6 +263,104 @@ def call_gemini_with_retries(client, prompt: str) -> str:
                 time.sleep(wait_seconds)
 
     raise RuntimeError(f"Gemini failed after {GEMINI_MAX_RETRIES} retries: {last_error}")
+
+
+# =========================
+# Profile rebuild helpers
+# =========================
+
+def ensure_profiles_headers(service) -> List[str]:
+    existing = sheets_get(service, f"{PROFILES_TAB}!1:1")
+    if not existing:
+        sheets_update(service, f"{PROFILES_TAB}!1:1", [EXPECTED_PROFILES_HEADERS])
+        return EXPECTED_PROFILES_HEADERS
+
+    headers = existing[0]
+    if headers != EXPECTED_PROFILES_HEADERS:
+        missing = [h for h in EXPECTED_PROFILES_HEADERS if h not in headers]
+        if missing:
+            headers = headers + missing
+            sheets_update(service, f"{PROFILES_TAB}!1:1", [headers])
+        return headers
+
+    return headers
+
+
+def load_profiles(service) -> Tuple[List[str], List[List[str]], Dict[str, int]]:
+    headers = ensure_profiles_headers(service)
+    rows = sheets_get(service, f"{PROFILES_TAB}!A2:R")
+    normalized_rows = [pad_row(r, len(headers)) for r in rows]
+
+    legislator_idx = get_col_index(headers, "Legislator")
+    index_by_legislator: Dict[str, int] = {}
+
+    for i, row in enumerate(normalized_rows):
+        name = clean(row[legislator_idx])
+        if name:
+            index_by_legislator[name] = i
+
+    return headers, normalized_rows, index_by_legislator
+
+
+def ensure_profile_row_exists_for_legislator(
+    service,
+    profile_headers: List[str],
+    profile_rows: List[List[str]],
+    profile_index: Dict[str, int],
+    legislator_name: str,
+) -> None:
+    if legislator_name in profile_index:
+        return
+
+    new_row = [""] * len(profile_headers)
+    new_row[get_col_index(profile_headers, "Legislator")] = legislator_name
+    new_row[get_col_index(profile_headers, "Profile_Processed")] = "FALSE"
+    new_row[get_col_index(profile_headers, "Needs_Rebuild")] = "TRUE"
+    new_row[get_col_index(profile_headers, "Last_Updated")] = now_iso()
+
+    profile_rows.append(new_row)
+    profile_index[legislator_name] = len(profile_rows) - 1
+
+    row_number = len(profile_rows) + 1
+    sheets_update(service, f"{PROFILES_TAB}!A{row_number}:R{row_number}", [new_row])
+
+
+def mark_profile_needs_rebuild(
+    service,
+    profile_headers: List[str],
+    profile_rows: List[List[str]],
+    profile_index: Dict[str, int],
+    legislator_name: str,
+) -> None:
+    ensure_profile_row_exists_for_legislator(
+        service,
+        profile_headers,
+        profile_rows,
+        profile_index,
+        legislator_name,
+    )
+
+    row_idx = profile_index[legislator_name]
+    row = profile_rows[row_idx]
+
+    needs_rebuild_idx = get_col_index(profile_headers, "Needs_Rebuild")
+    last_updated_idx = get_col_index(profile_headers, "Last_Updated")
+
+    row[needs_rebuild_idx] = "TRUE"
+    row[last_updated_idx] = now_iso()
+
+    sheet_row = row_idx + 2
+    updates = [
+        {
+            "range": f"{PROFILES_TAB}!R{sheet_row}",
+            "values": [[row[needs_rebuild_idx]]],
+        },
+        {
+            "range": f"{PROFILES_TAB}!O{sheet_row}",
+            "values": [[row[last_updated_idx]]],
+        },
+    ]
+    sheets_batch_update(service, updates)
 
 
 # =========================
@@ -361,95 +376,108 @@ def main():
     print(f"GEMINI_MAX_RETRIES: {GEMINI_MAX_RETRIES}")
     print(f"REQUEST_DELAY_SECONDS: {REQUEST_DELAY_SECONDS}")
     print(f"STOP_ON_QUOTA_EXHAUSTION: {STOP_ON_QUOTA_EXHAUSTION}")
+    print(f"ONLY_LEGISLATOR: {ONLY_LEGISLATOR or '(none)'}")
 
     sheets_service = get_sheets_service()
-    gemini_client = get_gemini_client()
+    gemini_client = None if DRY_RUN else get_gemini_client()
 
-    activity_rows = load_activity_rows(sheets_service)
+    activity_rows = sheets_get(sheets_service, ACTIVITY_RANGE)
+    activity_rows = [pad_row(r, len(EXPECTED_ACTIVITY_HEADERS)) for r in activity_rows]
+
     print(f"Loaded {len(activity_rows)} activity rows.")
 
-    raw_profile_headers, profile_header_index, profile_rows = ensure_profiles_has_needs_rebuild(sheets_service)
+    url_idx = get_col_index(EXPECTED_ACTIVITY_HEADERS, "URL")
+    legislator_idx = get_col_index(EXPECTED_ACTIVITY_HEADERS, "Legislator")
+    bill_number_idx = get_col_index(EXPECTED_ACTIVITY_HEADERS, "Bill Number")
+    title_idx = get_col_index(EXPECTED_ACTIVITY_HEADERS, "Bill Title")
+    summary_idx = get_col_index(EXPECTED_ACTIVITY_HEADERS, "Bill Summary")
+    processed_idx = get_col_index(EXPECTED_ACTIVITY_HEADERS, "Processed")
 
-    eligible = eligible_activity_rows(activity_rows)
+    eligible: List[Tuple[int, List[str]]] = []
+
+    for zero_based_idx, row in enumerate(activity_rows):
+        legislator = clean(row[legislator_idx])
+        processed = bool_from_cell(row[processed_idx])
+
+        if ONLY_LEGISLATOR and legislator != ONLY_LEGISLATOR:
+            continue
+
+        if processed:
+            continue
+
+        eligible.append((zero_based_idx, row))
+
     print(f"Found {len(eligible)} eligible unprocessed row(s).")
 
     to_process = eligible[:MAX_ITEMS_PER_RUN]
 
+    profile_headers, profile_rows, profile_index = load_profiles(sheets_service)
+
     processed_count = 0
-    skipped_count = 0
+    skipped_count = max(0, len(activity_rows) - len(to_process))
     error_count = 0
     quota_stopped = False
 
-    for row in to_process:
-        row_number = row["_row_number"]
-        url = clean(row.get("URL"))
-        legislator = clean(row.get("Legislator"))
+    for zero_based_idx, row in to_process:
+        row_number = zero_based_idx + 2
+        url = clean(row[url_idx])
+        legislator = clean(row[legislator_idx])
 
         print(f"Analyzing row {row_number}: {url}")
         print(f"Legislator: {legislator}")
 
         try:
             if DRY_RUN:
-                result = {
-                    "bill_number": clean(row.get("Bill_Number")) or "UNKNOWN",
-                    "bill_title": "Dry run title",
-                    "bill_summary": "Dry run summary.",
-                }
+                cleaned_title = clean(row[title_idx]) or clean(row[bill_number_idx]) or "Dry Run Title"
+                cleaned_summary = clean(row[summary_idx]) or "Dry run summary."
             else:
-                page_text = extract_page_text(url)
-                prompt = build_prompt(row, page_text)
-                raw_text = call_gemini_with_retries(gemini_client, prompt)
-                result = parse_json_response(raw_text)
+                page_text = fetch_page_text(url)
+                prompt = build_prompt(page_text, url)
+                result = call_gemini_with_retry(gemini_client, prompt)
 
-            bill_number = clean(result.get("bill_number")) or clean(row.get("Bill_Number"))
-            bill_title = clean(result.get("bill_title"))
-            bill_summary = clean(result.get("bill_summary"))
+                cleaned_title = result["title"] or clean(row[title_idx]) or clean(row[bill_number_idx]) or "Untitled legislative item"
+                cleaned_summary = result["summary"] or clean(row[summary_idx]) or "No summary available."
 
-            if not bill_title or not bill_summary:
-                raise RuntimeError("Gemini returned incomplete structured bill data.")
-
-            updates = [
-                {"range": f"Activity_Items!E{row_number}", "values": [[bill_number]]},
-                {"range": f"Activity_Items!F{row_number}", "values": [[bill_title]]},
-                {"range": f"Activity_Items!G{row_number}", "values": [[bill_summary]]},
-                {"range": f"Activity_Items!H{row_number}", "values": [["TRUE"]]},
-                {"range": f"Activity_Items!I{row_number}", "values": [[""]]},
-            ]
-            sheets_batch_update(sheets_service, updates)
-
-            # Mark profile for rebuild only after successful enrichment
-            mark_legislator_needs_rebuild(
+            update_values = [[
+                cleaned_title,
+                cleaned_summary,
+                "TRUE",
+            ]]
+            sheets_update(
                 sheets_service,
-                legislator=legislator,
-                profile_rows=profile_rows,
-                profile_header_index=profile_header_index,
+                f"{ACTIVITY_TAB}!F{row_number}:H{row_number}",
+                update_values,
             )
 
-            print(f"Success: {legislator} row {row_number} enriched.")
+            mark_profile_needs_rebuild(
+                sheets_service,
+                profile_headers,
+                profile_rows,
+                profile_index,
+                legislator,
+            )
+
             processed_count += 1
+            print(f"Success: {legislator} row {row_number} enriched.")
 
             time.sleep(REQUEST_DELAY_SECONDS)
 
         except Exception as e:
             error_text = str(e)
+            error_count += 1
 
             if looks_like_quota_error(error_text):
-                print(f"Quota stop: {error_text}")
-                error_count += 1
-                quota_stopped = True
-
+                print(f"Failed: {error_text}")
                 if STOP_ON_QUOTA_EXHAUSTION:
-                    print("Stopping run after quota exhaustion to avoid repeated failed calls.")
+                    quota_stopped = True
                     break
-
             else:
                 print(f"Failed: {error_text}")
-                error_count += 1
 
-    skipped_count = len(activity_rows) - len(eligible)
     print(
         f"Done. Processed={processed_count}, "
-        f"Skipped={skipped_count}, Errors={error_count}, QuotaStopped={quota_stopped}"
+        f"Skipped={skipped_count}, Errors={error_count}, "
+        f"QuotaStopped={quota_stopped}"
     )
 
 
