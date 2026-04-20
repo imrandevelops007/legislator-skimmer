@@ -2,7 +2,7 @@ name: Skim legislator sites
 
 on:
   schedule:
-    - cron: "0 17 * * *"  # 12:00 PM Eastern (17:00 UTC)
+    - cron: "0 17 * * *"
   workflow_dispatch:
 
 jobs:
@@ -31,23 +31,23 @@ jobs:
         run: |
           python main.py
 
-#      - name: Run analyzer
-#        env:
-#          SHEET_ID: ${{ secrets.SHEET_ID }}
-#          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-#          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-#          DRY_RUN: "false"
-#          GEMINI_MODEL: "gemini-2.5-flash"
-#          BATCH_SIZE: "3"
-#          MAX_ITEMS_PER_RUN: "3"
-#          MAX_PAGE_CHARS: "2500"
-#          GEMINI_MAX_RETRIES: "2"
-#          REQUEST_DELAY_SECONDS: "7"
-#          STOP_ON_QUOTA_EXHAUSTION: "true"
-#          ONLY_LEGISLATOR: "Nancy Jenkins-Arno"
-#        run: |
-#          python analyze.py
-          
+    # - name: Run analyzer
+    #   env:
+    #     SHEET_ID: ${{ secrets.SHEET_ID }}
+    #     GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    #     GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    #     DRY_RUN: "false"
+    #     GEMINI_MODEL: "gemini-2.5-flash"
+    #     BATCH_SIZE: "3"
+    #     MAX_ITEMS_PER_RUN: "3"
+    #     MAX_PAGE_CHARS: "2500"
+    #     GEMINI_MAX_RETRIES: "2"
+    #     REQUEST_DELAY_SECONDS: "7"
+    #     STOP_ON_QUOTA_EXHAUSTION: "true"
+    #     ONLY_LEGISLATOR: "Nancy Jenkins-Arno"
+    #   run: |
+    #     python analyze.py
+
       - name: Run profile builder
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -69,9 +69,9 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           DRIVE_REPORTS_FOLDER_ID: ${{ secrets.DRIVE_REPORTS_FOLDER_ID }}
-          TEMPLATE_DIR: templates
-          REPORT_TEMPLATE: report.html
+          TEMPLATE_DIR: "."
+          REPORT_TEMPLATE: "report.html"
           OVERWRITE_EXISTING_IN_TARGET_FOLDER: "true"
-          ONLY_PROCESSED_PROFILES: "true"
+          ONLY_LEGISLATOR: "Nancy Jenkins-Arno"
         run: |
           python report_generator.py
