@@ -11,9 +11,6 @@ from jinja2 import Environment, FileSystemLoader
 from weasyprint import HTML
 
 
-# =========================
-# Config
-# =========================
 SHEET_ID = os.environ["SHEET_ID"]
 DRIVE_REPORTS_FOLDER_ID = os.environ["DRIVE_REPORTS_FOLDER_ID"]
 
@@ -36,9 +33,6 @@ PROFILES_RANGE = "Profiles_Dynamic!A2:R"
 OUTPUT_DIR = "generated_reports"
 
 
-# =========================
-# Helpers
-# =========================
 def pad_row(row: List[str], target_len: int) -> List[str]:
     return row + [""] * (target_len - len(row))
 
@@ -76,10 +70,6 @@ def split_loose_list(text: str) -> List[str]:
             items.append(strip_markdown(item))
 
     return items if items else [text]
-
-
-def split_pipe(text: str) -> List[str]:
-    return [x.strip() for x in (text or "").split("|") if x.strip()]
 
 
 def split_key_bills(text: str) -> List[str]:
@@ -136,29 +126,23 @@ def format_counties_full(counties: str) -> str:
 
 def parse_biography_items(text: str) -> List[Tuple[str, str]]:
     items = []
-    raw_items = split_loose_list(text)
-
-    for raw in raw_items:
+    for raw in split_loose_list(text):
         if ":" in raw:
             label, body = raw.split(":", 1)
             items.append((label.strip(), body.strip()))
         else:
             items.append(("", raw.strip()))
-
     return items
 
 
 def parse_labeled_items(text: str) -> List[Tuple[str, str]]:
     items = []
-    raw_items = split_loose_list(text)
-
-    for raw in raw_items:
+    for raw in split_loose_list(text):
         if ":" in raw:
             label, body = raw.split(":", 1)
             items.append((label.strip(), body.strip()))
         else:
             items.append(("", raw.strip()))
-
     return items
 
 
@@ -331,9 +315,6 @@ def build_term_limit_note(row: Dict[str, str]) -> str:
     )
 
 
-# =========================
-# Google API clients
-# =========================
 def get_creds():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     return Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -357,9 +338,6 @@ def sheets_get_values(service, rng: str) -> List[List[str]]:
     )
 
 
-# =========================
-# Load data
-# =========================
 def load_legislators(service) -> Dict[str, Dict[str, str]]:
     rows = sheets_get_values(service, LEGISLATORS_RANGE)
     out = {}
@@ -452,9 +430,6 @@ def load_profiles(service) -> Dict[str, Dict[str, str]]:
     return out
 
 
-# =========================
-# Drive upload
-# =========================
 def list_existing_files_in_target_folder(drive_service, folder_id: str, filename: str):
     escaped_name = filename.replace("'", r"\'")
     query = (
@@ -533,9 +508,6 @@ def upload_pdf_to_drive(drive_service, local_path: str, filename: str, folder_id
     return created.get("webViewLink", "")
 
 
-# =========================
-# Rendering
-# =========================
 def render_html(row: Dict[str, str]) -> str:
     env = Environment(loader=FileSystemLoader(TEMPLATE_DIR))
     template = env.get_template(REPORT_TEMPLATE)
@@ -593,9 +565,6 @@ def write_pdf(html_string: str, output_path: str) -> None:
     HTML(string=html_string).write_pdf(output_path)
 
 
-# =========================
-# Main
-# =========================
 def main():
     sheets_service = get_sheets_service()
     drive_service = get_drive_service()
@@ -604,6 +573,10 @@ def main():
     metadata_by_name = load_metadata(sheets_service)
     profiles_by_name = load_profiles(sheets_service)
 
+    print(f"Loaded legislators config rows: {len(legislators_by_name)}")
+    print(f"Loaded metadata rows: {len(metadata_by_name)}")
+    print(f"Loaded processed profile rows: {len(profiles_by_name)}")
+
     legislators = sorted(
         set(legislators_by_name.keys()) &
         set(metadata_by_name.keys()) &
@@ -611,7 +584,17 @@ def main():
     )
 
     if ONLY_LEGISLATOR:
+        print(f"Filtering to ONLY_LEGISLATOR: {ONLY_LEGISLATOR}")
         legislators = [x for x in legislators if x == ONLY_LEGISLATOR]
+
+    if not legislators:
+        if ONLY_LEGISLATOR and ONLY_LEGISLATOR not in profiles_by_name:
+            print(
+                f"No report generated because '{ONLY_LEGISLATOR}' does not currently have "
+                f"a processed profile row with Profile_Processed=TRUE in Profiles_Dynamic."
+            )
+        else:
+            print("No legislators matched across Legislators, Legislator_Metadata, and processed Profiles_Dynamic rows.")
 
     print(f"Generating reports for {len(legislators)} legislator(s)...")
 
