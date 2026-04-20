@@ -146,12 +146,20 @@ def join_pipe_items(items: List[str]) -> str:
 
 
 def normalize_labeled_pipe_text(text: str) -> str:
-    items = split_loose_list(text)
+    text = strip_markdown(text)
+    if "||" in text:
+        items = [strip_markdown(x) for x in text.split("||") if strip_markdown(x)]
+    else:
+        items = split_loose_list(text)
     return join_pipe_items(items)
 
 
 def normalize_plain_pipe_text(text: str) -> str:
-    items = split_loose_list(text)
+    text = strip_markdown(text)
+    if "||" in text:
+        items = [strip_markdown(x) for x in text.split("||") if strip_markdown(x)]
+    else:
+        items = split_loose_list(text)
     return join_pipe_items(items)
 
 
