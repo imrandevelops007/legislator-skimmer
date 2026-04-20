@@ -74,8 +74,8 @@ def normalize_bill_prefix(bill_number: str) -> str:
     bill_number = clean(bill_number).upper()
     if not bill_number:
         return ""
-    m = re.match(r"^([A-Z]+)", bill_number)
-    return m.group(1) if m else ""
+    match = re.match(r"^([A-Z]+)", bill_number)
+    return match.group(1) if match else ""
 
 
 def looks_like_quota_error(text: str) -> bool:
@@ -97,6 +97,170 @@ def pad_row(row: List[str], length: int) -> List[str]:
     if len(row) < length:
         row = row + [""] * (length - len(row))
     return row[:length]
+
+
+def strip_markdown(text: str) -> str:
+    text = clean(text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"__(.*?)__", r"\1", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    return clean(text)
+
+
+def split_loose_list(text: str) -> List[str]:
+    """
+    Converts mixed markdown bullets / inline dash bullets / newlines into clean items.
+    """
+    text = strip_markdown(text)
+    if not text:
+        return []
+
+    normalized = text.replace("\r", "\n")
+    normalized = re.sub(r"\s*•\s*", "\n• ", normalized)
+    normalized = re.sub(r"\s*-\s+", "\n- ", normalized)
+
+    parts: List[str] = []
+    for raw in normalized.splitlines():
+        item = clean(raw)
+        if not item:
+            continue
+        item = re.sub(r"^[•\-–]+\s*", "", item).strip()
+        if item:
+            parts.append(item)
+
+    if not parts and normalized:
+        parts = [clean(normalized)]
+
+    return parts
+
+
+def join_pipe_items(items: List[str]) -> str:
+    cleaned = [strip_markdown(x) for x in items if strip_markdown(x)]
+    return " | ".join(cleaned)
+
+
+def normalize_labeled_pipe_text(text: str) -> str:
+    """
+    For sections like Biography and Key Issues.
+    Keeps content as Label: Body | Label: Body
+    """
+    items = split_loose_list(text)
+    return join_pipe_items(items)
+
+
+def normalize_plain_pipe_text(text: str) -> str:
+    """
+    For sections like District Signals, Focus, Talking Points, and Positioning bullets.
+    """
+    items = split_loose_list(text)
+    return join_pipe_items(items)
+
+
+def normalize_committee_text(text: str) -> str:
+    """
+    Converts committee bullets into:
+    Committee::Note || Committee::Note
+    """
+    items = split_loose_list(text)
+    out: List[str] = []
+
+    for item in items:
+        if "::" in item:
+            committee, note = item.split("::", 1)
+            committee = strip_markdown(committee)
+            note = strip_markdown(note)
+        elif ":" in item:
+            committee, note = item.split(":", 1)
+            committee = strip_markdown(committee)
+            note = strip_markdown(note)
+        else:
+            committee = strip_markdown(item)
+            note = ""
+
+        if committee:
+            out.append(f"{committee}::{note}" if note else committee)
+
+    return " || ".join(out)
+
+
+def normalize_key_bills_text(text: str) -> str:
+    """
+    Converts key bills into:
+    HB 4001::Description || HR 0040::Description
+    """
+    items = split_loose_list(text)
+    out: List[str] = []
+
+    for item in items:
+        if "::" in item:
+            bill, summary = item.split("::", 1)
+        elif ":" in item:
+            bill, summary = item.split(":", 1)
+        elif " – " in item:
+            bill, summary = item.split(" – ", 1)
+        else:
+            bill, summary = item, ""
+
+        bill = strip_markdown(bill)
+        summary = strip_markdown(summary)
+
+        if bill:
+            out.append(f"{bill}::{summary}" if summary else bill)
+
+    return " || ".join(out)
+
+
+def normalize_positioning_line(text: str) -> str:
+    """
+    Keeps a single short line such as:
+    Republican | Fiscal Conservative | Education-focused
+    """
+    text = strip_markdown(text)
+    if not text:
+        return ""
+
+    if "\n" in text:
+        text = text.splitlines()[0].strip()
+
+    return clean(text)
+
+
+def normalize_profile_result(result: Dict[str, str]) -> Dict[str, str]:
+    normalized = {field: clean(result.get(field, "")) for field in PROFILE_OUTPUT_FIELDS}
+
+    normalized["Committee_Relevance_Summary"] = normalize_committee_text(
+        normalized["Committee_Relevance_Summary"]
+    )
+    normalized["Time_In_Office_Summary"] = normalize_plain_pipe_text(
+        normalized["Time_In_Office_Summary"]
+    )
+    normalized["Generated_Biography"] = normalize_labeled_pipe_text(
+        normalized["Generated_Biography"]
+    )
+    normalized["Key_Issues"] = normalize_labeled_pipe_text(
+        normalized["Key_Issues"]
+    )
+    normalized["District_Development_Signals"] = normalize_plain_pipe_text(
+        normalized["District_Development_Signals"]
+    )
+    normalized["Legislative_Focus_Areas"] = normalize_plain_pipe_text(
+        normalized["Legislative_Focus_Areas"]
+    )
+    normalized["Key_Bills"] = normalize_key_bills_text(
+        normalized["Key_Bills"]
+    )
+    normalized["Political_Positioning"] = normalize_positioning_line(
+        normalized["Political_Positioning"]
+    )
+    normalized["Political_Positioning_Bullets"] = normalize_plain_pipe_text(
+        normalized["Political_Positioning_Bullets"]
+    )
+    normalized["SBDC_Framing"] = strip_markdown(normalized["SBDC_Framing"])
+    normalized["Talking_Points"] = normalize_plain_pipe_text(
+        normalized["Talking_Points"]
+    )
+
+    return normalized
 
 
 # =========================
@@ -234,32 +398,52 @@ def build_profile_prompt(legislator: str, metadata: Dict[str, str], selected_ite
     return f"""
 You are generating a structured legislator briefing profile for internal outreach use.
 
-Requirements:
-- Be factual and grounded.
-- Use only the metadata and legislative items provided.
-- Do not hallucinate.
-- Keep it skimmable and concise.
-- Prefer bullet-like phrasing.
-- Avoid redundancy across sections.
-- If legislative activity is mostly resolutions or joint resolutions, still generate a useful profile from those signals.
-- Prioritize substantive work when present, but do not refuse to build a profile if only lower-signal legislative activity is available.
-- Do not claim certainty beyond the provided data.
-- Keep talking points strategic, not scripted.
-- Keep political positioning concise and evidence-based.
+Use only the metadata and legislative items provided.
+Be factual, concise, and skimmable.
+Do not hallucinate.
+Avoid markdown bullets, numbered lists, or bold formatting.
+Do not include leading hyphens.
+Do not include line breaks inside field values unless absolutely necessary.
+Return JSON only.
+
+Formatting rules by field:
+- Committee_Relevance_Summary:
+  Store as: Committee::Why it matters || Committee::Why it matters
+- Time_In_Office_Summary:
+  Store as: Item | Item | Item
+- Generated_Biography:
+  Store as: Education: ... | Professional Experience: ... | Public Service: ...
+- Key_Issues:
+  Store as: Label: Detail | Label: Detail | Label: Detail
+- District_Development_Signals:
+  Store as: Item | Item | Item
+- Legislative_Focus_Areas:
+  Store as: Item | Item | Item
+- Key_Bills:
+  Store as: BILLNUMBER::Why it matters || BILLNUMBER::Why it matters
+  If there is no bill number, use a short title instead.
+- Political_Positioning:
+  Store as one short line like: Democratic | Leadership-oriented | Business-informed
+- Political_Positioning_Bullets:
+  Store as: Item | Item | Item
+- SBDC_Framing:
+  Store as one concise paragraph with no markdown
+- Talking_Points:
+  Store as: Item | Item | Item | Item
 
 Return valid JSON only with this exact shape:
 {{
-  "Committee_Relevance_Summary": "...",
-  "Time_In_Office_Summary": "...",
-  "Generated_Biography": "...",
-  "Key_Issues": "...",
-  "District_Development_Signals": "...",
-  "Legislative_Focus_Areas": "...",
-  "Key_Bills": "...",
-  "Political_Positioning": "...",
-  "Political_Positioning_Bullets": "...",
-  "SBDC_Framing": "...",
-  "Talking_Points": "..."
+  "Committee_Relevance_Summary": "",
+  "Time_In_Office_Summary": "",
+  "Generated_Biography": "",
+  "Key_Issues": "",
+  "District_Development_Signals": "",
+  "Legislative_Focus_Areas": "",
+  "Key_Bills": "",
+  "Political_Positioning": "",
+  "Political_Positioning_Bullets": "",
+  "SBDC_Framing": "",
+  "Talking_Points": ""
 }}
 
 Legislator:
@@ -322,7 +506,7 @@ def main():
     _, legislators_rows = load_tab_as_dicts(sheets_service, LEGISLATORS_RANGE)
     _, activity_rows = load_tab_as_dicts(sheets_service, ACTIVITY_RANGE)
     _, metadata_rows = load_tab_as_dicts(sheets_service, METADATA_RANGE)
-    profile_headers, profiles_rows = load_tab_as_dicts(sheets_service, PROFILES_RANGE)
+    _, profiles_rows = load_tab_as_dicts(sheets_service, PROFILES_RANGE)
 
     metadata_by_legislator = {
         clean(row.get("Legislator", "")): row
@@ -387,12 +571,19 @@ def main():
             )
             continue
 
+        if len(substantive) < MIN_SUBSTANTIVE_BILLS_REQUIRED and (len(substantive) + len(joint)) < MIN_SUBSTANTIVE_BILLS_REQUIRED:
+            print(
+                f"Continuing with lower-signal profile for {legislator}: "
+                f"{len(substantive)} substantive, {len(joint)} joint, {len(other)} other."
+            )
+
         selected_items = select_best_items(processed_items, MAX_BILLS_PER_LEGISLATOR)
         metadata = metadata_by_legislator.get(legislator, {})
         prompt = build_profile_prompt(legislator, metadata, selected_items)
 
         try:
-            result = call_gemini_with_retry(gemini_client, prompt)
+            raw_result = call_gemini_with_retry(gemini_client, prompt)
+            result = normalize_profile_result(raw_result)
         except Exception as e:
             error_text = str(e)
             print(f"Profile build failed for {legislator}: {error_text}")
