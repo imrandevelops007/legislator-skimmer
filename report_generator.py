@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from pathlib import Path
 from typing import List, Dict, Tuple
 
 from google.oauth2.service_account import Credentials
@@ -23,7 +24,8 @@ ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
     os.getenv("OVERWRITE_EXISTING_IN_TARGET_FOLDER", "true").strip().lower() == "true"
 )
-TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", ".").strip() or "."
+
+TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", "").strip()
 REPORT_TEMPLATE = os.getenv("REPORT_TEMPLATE", "report.html").strip() or "report.html"
 
 LEGISLATORS_RANGE = "Legislators!A2:F"
@@ -430,8 +432,35 @@ def load_profiles(service) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def resolve_template_path() -> tuple[str, str]:
+    """
+    Returns (template_dir, template_name)
+    """
+    candidates = []
+
+    if TEMPLATE_DIR:
+        candidates.append(Path(TEMPLATE_DIR) / REPORT_TEMPLATE)
+
+    candidates.extend([
+        Path(REPORT_TEMPLATE),
+        Path("templates") / REPORT_TEMPLATE,
+        Path(__file__).resolve().parent / REPORT_TEMPLATE,
+        Path(__file__).resolve().parent / "templates" / REPORT_TEMPLATE,
+    ])
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            print(f"Using template file: {candidate}")
+            return str(candidate.parent), candidate.name
+
+    checked = "\n".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"Could not find template '{REPORT_TEMPLATE}'. Checked these paths:\n{checked}"
+    )
+
+
 def list_existing_files_in_target_folder(drive_service, folder_id: str, filename: str):
-    escaped_name = filename.replace("'", r"\'")
+    escaped_name = filename.replace("'", r"\\'")
     query = (
         f"'{folder_id}' in parents and "
         f"name = '{escaped_name}' and "
@@ -508,9 +537,9 @@ def upload_pdf_to_drive(drive_service, local_path: str, filename: str, folder_id
     return created.get("webViewLink", "")
 
 
-def render_html(row: Dict[str, str]) -> str:
-    env = Environment(loader=FileSystemLoader(TEMPLATE_DIR))
-    template = env.get_template(REPORT_TEMPLATE)
+def render_html(row: Dict[str, str], template_dir: str, template_name: str) -> str:
+    env = Environment(loader=FileSystemLoader(template_dir))
+    template = env.get_template(template_name)
 
     chamber_label = row["Chamber"]
     if chamber_label.lower() == "senate":
@@ -577,6 +606,8 @@ def main():
     print(f"Loaded metadata rows: {len(metadata_by_name)}")
     print(f"Loaded processed profile rows: {len(profiles_by_name)}")
 
+    template_dir, template_name = resolve_template_path()
+
     legislators = sorted(
         set(legislators_by_name.keys()) &
         set(metadata_by_name.keys()) &
@@ -615,7 +646,7 @@ def main():
             skipped_count += 1
             continue
 
-        html = render_html(merged)
+        html = render_html(merged, template_dir, template_name)
 
         slug = slugify(legislator)
         filename = f"{slug}.pdf"
