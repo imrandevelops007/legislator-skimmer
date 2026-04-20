@@ -16,27 +16,14 @@ from googleapiclient.discovery import build
 SHEET_ID = os.environ["SHEET_ID"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# How many document links to collect per legislator per run
+# How many document links to keep per legislator
 MAX_LINKS_FROM_HUB = 25
 
-# Legislators columns expected:
-# A: name
-# B: website (not used in bill-only mode, but kept for compatibility)
-# F: hub_url override (MUST be a legislature Search/ExecuteSearch URL)
 LEGISLATORS_RANGE = "Legislators!A2:F"
-
-# Activity_Items columns:
-# A: url
-# B: legislator_name
-# C: source_type (always "bill" in bill-only mode)
-# D: captured_at
-# E: bill_number
-# F: bill_title
-# G: bill_summary
-# H: processed
-# I: notes
-ACTIVITY_RANGE_APPEND = "Activity_Items!A:I"
-ACTIVITY_DEDUPE_RANGE = "Activity_Items!A2:B"
+ACTIVITY_RANGE_ALL = "Activity_Items!A2:I"
+ACTIVITY_HEADERS_RANGE = "Activity_Items!A1:I1"
+PROFILES_RANGE_ALL = "Profiles_Dynamic!A2:R"
+PROFILES_HEADERS_RANGE = "Profiles_Dynamic!A1:R1"
 
 
 # =========================
@@ -59,17 +46,51 @@ def sheets_get_values(service, rng: str):
     )
 
 
-def sheets_append_values(service, rng: str, rows: list[list[str]]):
-    if not rows:
-        return
+def sheets_update_values(service, rng: str, rows: list[list[str]]):
     body = {"values": rows}
-    service.spreadsheets().values().append(
+    service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
         range=rng,
         valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
         body=body
     ).execute()
+
+
+def sheets_clear(service, rng: str):
+    service.spreadsheets().values().clear(
+        spreadsheetId=SHEET_ID,
+        range=rng,
+        body={}
+    ).execute()
+
+
+def sheets_batch_update(service, data: list[dict]):
+    if not data:
+        return
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=SHEET_ID,
+        body={
+            "valueInputOption": "RAW",
+            "data": data,
+        }
+    ).execute()
+
+
+# =========================
+# Generic helpers
+# =========================
+def clean(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def pad_row(row: list[str], length: int) -> list[str]:
+    if len(row) < length:
+        return row + [""] * (length - len(row))
+    return row[:length]
+
+
+def bool_from_cell(value) -> bool:
+    return clean(value).lower() in {"true", "1", "yes", "y"}
 
 
 # =========================
@@ -84,19 +105,11 @@ def normalize_url(base: str, href: str) -> str:
 
 
 def canonicalize_legislature_url(u: str) -> str:
-    """
-    Remove tracking params like queryID from GetObject URLs.
-    Keeps only objectName.
-
-    Example:
-      ...GetObject?objectName=2025-HB-4102&queryID=123
-      -> ...GetObject?objectName=2025-HB-4102
-    """
     parsed = urlparse(u)
-    m = re.search(r"(objectname=[^&]+)", parsed.query, flags=re.IGNORECASE)
-    if not m:
+    match = re.search(r"(objectname=[^&]+)", parsed.query, flags=re.IGNORECASE)
+    if not match:
         return u
-    clean_query = m.group(1)
+    clean_query = match.group(1)
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{clean_query}"
 
 
@@ -111,16 +124,6 @@ def ensure_printer_friendly(url: str) -> str:
 # Sheet readers
 # =========================
 def read_legislators(service):
-    """
-    Reads Legislators!A2:F
-    A = name
-    B = website_url
-    F = hub_url override (required in bill-only mode)
-
-    Returns:
-        list[tuple[str, str, str]]
-        (name, website_url, hub_url_or_blank)
-    """
     rows = sheets_get_values(service, LEGISLATORS_RANGE)
     parsed: list[tuple[str, str, str]] = []
 
@@ -128,9 +131,9 @@ def read_legislators(service):
         if not r:
             continue
 
-        name = (r[0] or "").strip() if len(r) >= 1 else ""
-        website = (r[1] or "").strip() if len(r) >= 2 else ""
-        hub = (r[5] or "").strip() if len(r) >= 6 else ""
+        name = clean(r[0]) if len(r) >= 1 else ""
+        website = clean(r[1]) if len(r) >= 2 else ""
+        hub = clean(r[5]) if len(r) >= 6 else ""
 
         if name:
             parsed.append((name, website, hub))
@@ -138,38 +141,22 @@ def read_legislators(service):
     return parsed
 
 
-def read_existing_activity_pairs(service) -> set[tuple[str, str]]:
-    """
-    Reads Activity_Items!A2:B and returns a set of (url, legislator_name).
+def read_activity_rows(service) -> list[list[str]]:
+    rows = sheets_get_values(service, ACTIVITY_RANGE_ALL)
+    return [pad_row(r, 9) for r in rows]
 
-    This lets Activity_Items act as both:
-    - the intake database
-    - the duplicate checker
-    """
-    rows = sheets_get_values(service, ACTIVITY_DEDUPE_RANGE)
-    out: set[tuple[str, str]] = set()
 
-    for r in rows:
-        if not r or len(r) < 2:
-            continue
-
-        url = (r[0] or "").strip()
-        name = (r[1] or "").strip()
-
-        if url and name:
-            out.add((url, name))
-
-    return out
+def read_profiles(service) -> tuple[list[str], list[list[str]]]:
+    headers = sheets_get_values(service, PROFILES_HEADERS_RANGE)
+    header_row = headers[0] if headers else []
+    rows = sheets_get_values(service, PROFILES_RANGE_ALL)
+    return header_row, [pad_row(r, max(18, len(header_row) if header_row else 18)) for r in rows]
 
 
 # =========================
-# Legislature Search collector (Playwright)
+# Legislature Search collector
 # =========================
 def collect_legislature_search_result_links(search_url: str) -> list[str]:
-    """
-    Extract bill/resolution detail links from legislature Search/ExecuteSearch pages.
-    Returns canonical GetObject URLs with queryID stripped.
-    """
     search_url = ensure_printer_friendly(search_url)
 
     with sync_playwright() as p:
@@ -184,15 +171,12 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
 
         page.goto(search_url, wait_until="networkidle", timeout=120000)
 
-        # Light scroll to encourage any deferred rendering
         for _ in range(8):
             page.evaluate("() => window.scrollBy(0, document.body.scrollHeight)")
             page.wait_for_timeout(250)
 
         html = page.content()
 
-        # Stage A: regex objectName extraction
-        # Works even if links are not standard anchors
         obj_names = re.findall(
             r"objectName=([A-Za-z0-9\-]+)",
             html,
@@ -205,7 +189,6 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
                 u = f"https://www.legislature.mi.gov/Home/GetObject?objectName={obj}"
                 links.append(canonicalize_legislature_url(u))
 
-        # Stage B: fallback to anchor href extraction if regex yields nothing
         if not links:
             hrefs = page.eval_on_selector_all(
                 "a[href]",
@@ -222,7 +205,6 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
 
         browser.close()
 
-    # De-dupe while preserving order
     seen = set()
     uniq: list[str] = []
     for u in links:
@@ -235,32 +217,116 @@ def collect_legislature_search_result_links(search_url: str) -> list[str]:
 
 
 # =========================
-# Main (Bill-only mode)
+# Profile helpers
+# =========================
+def ensure_profile_row_exists(service, profile_headers: list[str], profile_rows: list[list[str]], legislator_name: str) -> int | None:
+    if not profile_headers:
+        return None
+
+    try:
+        legislator_idx = profile_headers.index("Legislator")
+        processed_idx = profile_headers.index("Profile_Processed")
+        last_updated_idx = profile_headers.index("Last_Updated")
+        needs_rebuild_idx = profile_headers.index("Needs_Rebuild")
+    except ValueError:
+        return None
+
+    for i, row in enumerate(profile_rows):
+        if clean(row[legislator_idx]) == legislator_name:
+            return i
+
+    new_row = [""] * len(profile_headers)
+    new_row[legislator_idx] = legislator_name
+    new_row[processed_idx] = "FALSE"
+    new_row[last_updated_idx] = datetime.now(timezone.utc).isoformat()
+    new_row[needs_rebuild_idx] = "TRUE"
+
+    sheet_row_number = len(profile_rows) + 2
+    sheets_update_values(service, f"Profiles_Dynamic!A{sheet_row_number}:R{sheet_row_number}", [new_row])
+    profile_rows.append(new_row)
+    return len(profile_rows) - 1
+
+
+def mark_profiles_needs_rebuild(service, changed_legislators: list[str], profile_headers: list[str], profile_rows: list[list[str]]):
+    if not changed_legislators or not profile_headers:
+        return
+
+    try:
+        legislator_idx = profile_headers.index("Legislator")
+        last_updated_idx = profile_headers.index("Last_Updated")
+        needs_rebuild_idx = profile_headers.index("Needs_Rebuild")
+    except ValueError:
+        return
+
+    updates = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    for legislator_name in changed_legislators:
+        row_idx = ensure_profile_row_exists(service, profile_headers, profile_rows, legislator_name)
+        if row_idx is None:
+            continue
+
+        profile_rows[row_idx][last_updated_idx] = now
+        profile_rows[row_idx][needs_rebuild_idx] = "TRUE"
+
+        sheet_row = row_idx + 2
+        updates.append({
+            "range": f"Profiles_Dynamic!O{sheet_row}",
+            "values": [[now]],
+        })
+        updates.append({
+            "range": f"Profiles_Dynamic!R{sheet_row}",
+            "values": [["TRUE"]],
+        })
+
+    sheets_batch_update(service, updates)
+
+
+# =========================
+# Main
 # =========================
 def main():
     service = get_sheets_service()
     legislators = read_legislators(service)
-
-    existing_pairs = read_existing_activity_pairs(service)
+    activity_rows = read_activity_rows(service)
+    profile_headers, profile_rows = read_profiles(service)
 
     now = datetime.now(timezone.utc).isoformat()
-    print(
-        f"Found {len(legislators)} legislator(s). "
-        f"Already logged {len(existing_pairs)} (url,name) pair(s) in Activity_Items."
-    )
 
-    new_activity_rows: list[list[str]] = []
+    print(f"Found {len(legislators)} legislator(s).")
+    print(f"Loaded {len(activity_rows)} existing activity row(s).")
+
+    configured_names = [name for name, _, _ in legislators]
+    configured_set = set(configured_names)
+
+    # Group existing rows by legislator and url so we can preserve enriched data
+    existing_by_legislator_and_url: dict[tuple[str, str], list[str]] = {}
+    existing_urls_by_legislator: dict[str, list[str]] = {}
+
+    for row in activity_rows:
+        row = pad_row(row, 9)
+        url = clean(row[0])
+        legislator = clean(row[1])
+
+        if not legislator or not url:
+            continue
+
+        existing_by_legislator_and_url[(legislator, url)] = row
+        existing_urls_by_legislator.setdefault(legislator, []).append(url)
+
+    rebuilt_rows: list[list[str]] = []
+    changed_legislators: list[str] = []
 
     for name, _home, hub_override in legislators:
         print(f"\n=== {name} ===")
 
-        hub = (hub_override or "").strip()
+        hub = clean(hub_override)
         if not hub:
-            print("No hub_url provided. Skipping (bill-only mode).")
+            print("No hub_url provided. Skipping.")
             continue
 
         if "legislature.mi.gov/search/executesearch" not in hub.lower():
-            print("Hub is not a legislature Search/ExecuteSearch URL. Skipping (bill-only mode).")
+            print("Hub is not a legislature Search/ExecuteSearch URL. Skipping.")
             continue
 
         hub = ensure_printer_friendly(hub)
@@ -274,40 +340,78 @@ def main():
             )
         except Exception as e:
             print(f"Failed to collect legislature search results: {e}")
+
+            # preserve existing rows for this legislator if collection fails
+            existing_rows_for_legislator = [
+                existing_by_legislator_and_url[(name, url)]
+                for url in existing_urls_by_legislator.get(name, [])
+                if (name, url) in existing_by_legislator_and_url
+            ]
+            rebuilt_rows.extend(existing_rows_for_legislator)
             continue
 
-        added = 0
-        for u in bill_links:
-            ul = u.lower()
+        old_urls = existing_urls_by_legislator.get(name, [])
+        if old_urls != bill_links:
+            changed_legislators.append(name)
 
-            # Safety: enforce legislature GetObject only
-            if "/home/getobject" not in ul or "objectname=" not in ul:
-                continue
+        kept_processed = 0
+        new_unprocessed = 0
 
-            key = (u, name)
-            if key in existing_pairs:
-                continue
+        for url in bill_links:
+            key = (name, url)
+            existing_row = existing_by_legislator_and_url.get(key)
 
-            existing_pairs.add(key)
+            if existing_row:
+                # preserve enrichment, but refresh timestamp to reflect current retained set
+                refreshed = pad_row(existing_row, 9)
+                refreshed[3] = now
+                rebuilt_rows.append(refreshed)
 
-            new_activity_rows.append([
-                u,          # URL
-                name,       # Legislator
-                "bill",     # Type
-                now,        # Timestamp
-                "",         # Bill Number
-                "",         # Bill Title
-                "",         # Bill Summary
-                "FALSE",    # Processed
-                "",         # Notes
-            ])
-            added += 1
+                if bool_from_cell(refreshed[7]):
+                    kept_processed += 1
+            else:
+                rebuilt_rows.append([
+                    url,       # URL
+                    name,      # Legislator
+                    "bill",    # Type
+                    now,       # Timestamp
+                    "",        # Bill Number
+                    "",        # Bill Title
+                    "",        # Bill Summary
+                    "FALSE",   # Processed
+                    "",        # Notes
+                ])
+                new_unprocessed += 1
 
-        print(f"Added {added} new bill(s).")
+        removed_count = max(0, len(old_urls) - len(bill_links))
+        print(
+            f"Kept {len(bill_links) - new_unprocessed} existing row(s), "
+            f"added {new_unprocessed} new row(s), "
+            f"dropped {removed_count} old row(s). "
+            f"Preserved processed={kept_processed}."
+        )
 
-    sheets_append_values(service, ACTIVITY_RANGE_APPEND, new_activity_rows)
+    # Preserve any rows for legislators not currently in config
+    other_rows = [
+        row for row in activity_rows
+        if clean(row[1]) not in configured_set
+    ]
+    if other_rows:
+        print(f"\nPreserving {len(other_rows)} row(s) for non-configured legislator(s).")
+        rebuilt_rows.extend(other_rows)
 
-    print(f"\nAppended {len(new_activity_rows)} new row(s) to Activity_Items.")
+    # Rewrite Activity_Items body
+    sheets_clear(service, ACTIVITY_RANGE_ALL)
+    if rebuilt_rows:
+        sheets_update_values(service, ACTIVITY_RANGE_ALL, rebuilt_rows)
+
+    print(f"\nRebuilt Activity_Items with {len(rebuilt_rows)} total row(s).")
+
+    if changed_legislators:
+        print(f"Marking {len(changed_legislators)} legislator profile(s) for rebuild.")
+        mark_profiles_needs_rebuild(service, changed_legislators, profile_headers, profile_rows)
+    else:
+        print("No legislator top-25 sets changed. No profile rebuild flags updated.")
 
 
 if __name__ == "__main__":
