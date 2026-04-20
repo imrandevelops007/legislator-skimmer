@@ -67,6 +67,21 @@ PROFILE_OUTPUT_FIELDS = [
 # Helpers
 # =========================
 
+def parse_timestamp(value: Any) -> datetime:
+    text = clean(value)
+    if not text:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
 def clean(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
@@ -322,32 +337,39 @@ def load_tab_as_dicts(service, rng: str) -> Tuple[List[str], List[Dict[str, str]
 # Ranking logic
 # =========================
 
-def item_priority(item: Dict[str, str]) -> Tuple[int, int]:
+def item_priority_rank(item: Dict[str, str]) -> int:
     bill_number = clean(item.get("Bill Number", ""))
     prefix = normalize_bill_prefix(bill_number)
 
     if prefix in {"HB", "SB"}:
-        tier = 1
-    elif prefix in {"HJR", "SJR"}:
-        tier = 2
-    elif prefix in {"HR", "SR", "HCR", "SCR"}:
-        tier = 3
-    else:
-        tier = 4
+        return 4
+    if prefix in {"HJR", "SJR"}:
+        return 3
+    if prefix in {"HR", "SR", "HCR", "SCR"}:
+        return 2
+    return 1
 
-    detail_bonus = 0
+
+def detail_score(item: Dict[str, str]) -> int:
+    score = 0
     if clean(item.get("Bill Title", "")):
-        detail_bonus -= 1
-    if bill_number:
-        detail_bonus -= 1
-
-    return (tier, detail_bonus)
+        score += 1
+    if clean(item.get("Bill Number", "")):
+        score += 1
+    return score
 
 
 def select_best_items(items: List[Dict[str, str]], limit: int) -> List[Dict[str, str]]:
-    ranked = sorted(items, key=item_priority)
+    ranked = sorted(
+        items,
+        key=lambda item: (
+            parse_timestamp(item.get("Timestamp", "")),
+            item_priority_rank(item),
+            detail_score(item),
+        ),
+        reverse=True,
+    )
     return ranked[:limit]
-
 
 def split_items(items: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
     substantive = []
