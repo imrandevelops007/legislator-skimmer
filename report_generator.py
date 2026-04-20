@@ -26,10 +26,12 @@ ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
     os.getenv("OVERWRITE_EXISTING_IN_TARGET_FOLDER", "true").strip().lower() == "true"
 )
+TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", ".").strip() or "."
+REPORT_TEMPLATE = os.getenv("REPORT_TEMPLATE", "report.html").strip() or "report.html"
 
 LEGISLATORS_RANGE = "Legislators!A2:F"
 METADATA_RANGE = "Legislator_Metadata!A2:Q"
-PROFILES_RANGE = "Profiles_Dynamic!A2:Q"
+PROFILES_RANGE = "Profiles_Dynamic!A2:R"
 
 OUTPUT_DIR = "generated_reports"
 
@@ -41,21 +43,64 @@ def pad_row(row: List[str], target_len: int) -> List[str]:
     return row + [""] * (target_len - len(row))
 
 
+def strip_markdown(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"__(.*?)__", r"\1", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    return text.strip()
+
+
+def split_loose_list(text: str) -> List[str]:
+    text = strip_markdown(text)
+    if not text:
+        return []
+
+    if "||" in text:
+        return [strip_markdown(x) for x in text.split("||") if strip_markdown(x)]
+
+    if "|" in text:
+        return [strip_markdown(x) for x in text.split("|") if strip_markdown(x)]
+
+    normalized = text.replace("\r", "\n")
+    normalized = re.sub(r"\s*•\s*", "\n• ", normalized)
+    normalized = re.sub(r"\s*-\s+", "\n- ", normalized)
+
+    items: List[str] = []
+    for raw in normalized.splitlines():
+        item = raw.strip()
+        if not item:
+            continue
+        item = re.sub(r"^[•\-–]+\s*", "", item).strip()
+        if item:
+            items.append(strip_markdown(item))
+
+    return items if items else [text]
+
+
 def split_pipe(text: str) -> List[str]:
     return [x.strip() for x in (text or "").split("|") if x.strip()]
 
 
 def split_key_bills(text: str) -> List[str]:
+    text = strip_markdown(text)
     items = []
-    for part in (text or "").split("||"):
-        part = part.strip()
-        if not part:
-            continue
+
+    if "||" in text:
+        parts = [p.strip() for p in text.split("||") if p.strip()]
+    else:
+        parts = split_loose_list(text)
+
+    for part in parts:
         if "::" in part:
             bill, summary = part.split("::", 1)
             items.append(f"{bill.strip()} – {summary.strip()}")
+        elif ":" in part:
+            bill, summary = part.split(":", 1)
+            items.append(f"{bill.strip()} – {summary.strip()}")
         else:
-            items.append(part)
+            items.append(part.strip())
+
     return items
 
 
@@ -91,37 +136,55 @@ def format_counties_full(counties: str) -> str:
 
 def parse_biography_items(text: str) -> List[Tuple[str, str]]:
     items = []
-    for raw in split_pipe(text):
+    raw_items = split_loose_list(text)
+
+    for raw in raw_items:
         if ":" in raw:
             label, body = raw.split(":", 1)
             items.append((label.strip(), body.strip()))
         else:
             items.append(("", raw.strip()))
+
     return items
 
 
 def parse_labeled_items(text: str) -> List[Tuple[str, str]]:
     items = []
-    for raw in split_pipe(text):
+    raw_items = split_loose_list(text)
+
+    for raw in raw_items:
         if ":" in raw:
             label, body = raw.split(":", 1)
             items.append((label.strip(), body.strip()))
         else:
             items.append(("", raw.strip()))
+
     return items
+
+
+def parse_plain_items(text: str) -> List[str]:
+    return split_loose_list(text)
 
 
 def parse_committee_items(text: str) -> List[Tuple[str, str]]:
     items = []
-    for raw in (text or "").split("||"):
-        raw = raw.strip()
-        if not raw:
-            continue
+    text = strip_markdown(text)
+
+    if "||" in text:
+        raw_items = [x.strip() for x in text.split("||") if x.strip()]
+    else:
+        raw_items = split_loose_list(text)
+
+    for raw in raw_items:
         if "::" in raw:
             committee, relevance = raw.split("::", 1)
             items.append((committee.strip(), relevance.strip()))
+        elif ":" in raw:
+            committee, relevance = raw.split(":", 1)
+            items.append((committee.strip(), relevance.strip()))
         else:
             items.append((raw.strip(), ""))
+
     return items
 
 
@@ -176,19 +239,38 @@ def extract_previous_service_ranges(note: str) -> List[Tuple[int, int]]:
     if not note:
         return []
 
-    note_lower = note.lower()
+    lowered = note.lower()
     ranges: List[Tuple[int, int]] = []
 
-    previous_section_match = re.search(r"previously served.*", note_lower)
-    if previous_section_match:
-        previous_text = previous_section_match.group(0)
-        for start, end in re.findall(r"(\d{4})\s*(?:-|–|to)\s*(\d{4})", previous_text):
+    patterns = [
+        r"previously served.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+        r"prior service.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+        r"prior house service.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+        r"non-consecutive term.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+    ]
+
+    for pattern in patterns:
+        for start, end in re.findall(pattern, lowered):
             start_year = int(start)
             end_year = int(end)
             if end_year >= start_year:
                 ranges.append((start_year, end_year))
 
-    return ranges
+    if not ranges:
+        for start, end in re.findall(r"(\d{4})\s*(?:-|–|to)\s*(\d{4})", lowered):
+            start_year = int(start)
+            end_year = int(end)
+            if end_year >= start_year:
+                ranges.append((start_year, end_year))
+
+    deduped = []
+    seen = set()
+    for item in ranges:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+
+    return deduped
 
 
 def estimate_legislative_service_years(row: Dict[str, str]) -> int | None:
@@ -205,7 +287,7 @@ def estimate_legislative_service_years(row: Dict[str, str]) -> int | None:
     current_term_years = end_year - start_year
 
     since_match = re.search(r"since\s+(?:jan\.?\s*1,\s*)?(\d{4})", note, flags=re.IGNORECASE)
-    if since_match and "previously served" not in note.lower():
+    if since_match and "prior" not in note.lower() and "previous" not in note.lower():
         since_year = int(since_match.group(1))
         if end_year > since_year:
             return end_year - since_year
@@ -338,7 +420,7 @@ def load_profiles(service) -> Dict[str, Dict[str, str]]:
     out = {}
 
     for row in rows:
-        row = pad_row(row, 17)
+        row = pad_row(row, 18)
         legislator = row[0].strip()
         if not legislator:
             continue
@@ -364,6 +446,7 @@ def load_profiles(service) -> Dict[str, Dict[str, str]]:
             "Last_Updated": row[14].strip(),
             "Profile_Processed": row[15].strip(),
             "Notes": row[16].strip(),
+            "Needs_Rebuild": row[17].strip() if len(row) > 17 else "",
         }
 
     return out
@@ -454,8 +537,8 @@ def upload_pdf_to_drive(drive_service, local_path: str, filename: str, folder_id
 # Rendering
 # =========================
 def render_html(row: Dict[str, str]) -> str:
-    env = Environment(loader=FileSystemLoader("templates"))
-    template = env.get_template("report.html")
+    env = Environment(loader=FileSystemLoader(TEMPLATE_DIR))
+    template = env.get_template(REPORT_TEMPLATE)
 
     chamber_label = row["Chamber"]
     if chamber_label.lower() == "senate":
@@ -474,7 +557,7 @@ def render_html(row: Dict[str, str]) -> str:
     else:
         location_line = counties
 
-    time_in_office_items = split_pipe(row["Time_In_Office_Summary"])
+    time_in_office_items = parse_plain_items(row["Time_In_Office_Summary"])
     term_limit_note = build_term_limit_note(row)
     if term_limit_note:
         time_in_office_items.append(term_limit_note)
@@ -496,13 +579,13 @@ def render_html(row: Dict[str, str]) -> str:
         time_in_office=time_in_office_items,
         bio=parse_biography_items(row["Generated_Biography"]),
         issues=parse_labeled_items(row["Key_Issues"]),
-        district_signals=split_pipe(row["District_Development_Signals"]),
-        focus=split_pipe(row["Legislative_Focus_Areas"]),
+        district_signals=parse_plain_items(row["District_Development_Signals"]),
+        focus=parse_plain_items(row["Legislative_Focus_Areas"]),
         bills=split_key_bills(row["Key_Bills"]),
-        positioning=row["Political_Positioning"],
-        positioning_notes=split_pipe(row["Political_Positioning_Bullets"]),
-        sbdc=row["SBDC_Framing"],
-        talking=split_pipe(row["Talking_Points"]),
+        positioning=strip_markdown(row["Political_Positioning"]),
+        positioning_notes=parse_plain_items(row["Political_Positioning_Bullets"]),
+        sbdc=strip_markdown(row["SBDC_Framing"]),
+        talking=parse_plain_items(row["Talking_Points"]),
     )
 
 
