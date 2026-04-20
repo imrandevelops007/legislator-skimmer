@@ -20,12 +20,21 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+PRIMARY_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+FALLBACK_GEMINI_MODELS = [
+    x.strip()
+    for x in os.getenv(
+        "FALLBACK_GEMINI_MODELS",
+        "gemini-2.5-flash-lite,gemini-2.0-flash"
+    ).split(",")
+    if x.strip()
+]
+
 MAX_BILLS_PER_LEGISLATOR = int(os.getenv("MAX_BILLS_PER_LEGISLATOR", "12"))
 MIN_SUBSTANTIVE_BILLS_REQUIRED = int(os.getenv("MIN_SUBSTANTIVE_BILLS_REQUIRED", "4"))
 MIN_TOTAL_ITEMS_REQUIRED = int(os.getenv("MIN_TOTAL_ITEMS_REQUIRED", "6"))
-PROFILE_MAX_RETRIES = int(os.getenv("PROFILE_MAX_RETRIES", "2"))
-PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "5"))
+PROFILE_MAX_RETRIES = int(os.getenv("PROFILE_MAX_RETRIES", "3"))
+PROFILE_REQUEST_DELAY_SECONDS = float(os.getenv("PROFILE_REQUEST_DELAY_SECONDS", "8"))
 STOP_ON_QUOTA_EXHAUSTION = os.getenv("STOP_ON_QUOTA_EXHAUSTION", "true").strip().lower() == "true"
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
@@ -108,9 +117,6 @@ def strip_markdown(text: str) -> str:
 
 
 def split_loose_list(text: str) -> List[str]:
-    """
-    Converts mixed markdown bullets / inline dash bullets / newlines into clean items.
-    """
     text = strip_markdown(text)
     if not text:
         return []
@@ -140,27 +146,16 @@ def join_pipe_items(items: List[str]) -> str:
 
 
 def normalize_labeled_pipe_text(text: str) -> str:
-    """
-    For sections like Biography and Key Issues.
-    Keeps content as Label: Body | Label: Body
-    """
     items = split_loose_list(text)
     return join_pipe_items(items)
 
 
 def normalize_plain_pipe_text(text: str) -> str:
-    """
-    For sections like District Signals, Focus, Talking Points, and Positioning bullets.
-    """
     items = split_loose_list(text)
     return join_pipe_items(items)
 
 
 def normalize_committee_text(text: str) -> str:
-    """
-    Converts committee bullets into:
-    Committee::Note || Committee::Note
-    """
     items = split_loose_list(text)
     out: List[str] = []
 
@@ -184,10 +179,6 @@ def normalize_committee_text(text: str) -> str:
 
 
 def normalize_key_bills_text(text: str) -> str:
-    """
-    Converts key bills into:
-    HB 4001::Description || HR 0040::Description
-    """
     items = split_loose_list(text)
     out: List[str] = []
 
@@ -211,17 +202,11 @@ def normalize_key_bills_text(text: str) -> str:
 
 
 def normalize_positioning_line(text: str) -> str:
-    """
-    Keeps a single short line such as:
-    Republican | Fiscal Conservative | Education-focused
-    """
     text = strip_markdown(text)
     if not text:
         return ""
-
     if "\n" in text:
         text = text.splitlines()[0].strip()
-
     return clean(text)
 
 
@@ -461,36 +446,63 @@ Legislative Items:
 # Gemini
 # =========================
 
+def call_gemini_once(client, model_name: str, prompt: str) -> Dict[str, str]:
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+    )
+    text = clean(getattr(response, "text", ""))
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text.strip()).strip()
+
+    parsed = json.loads(text)
+    return {field: clean(parsed.get(field, "")) for field in PROFILE_OUTPUT_FIELDS}
+
+
 def call_gemini_with_retry(client, prompt: str) -> Dict[str, str]:
     last_error = None
+    models_to_try = [PRIMARY_GEMINI_MODEL] + [
+        m for m in FALLBACK_GEMINI_MODELS if m != PRIMARY_GEMINI_MODEL
+    ]
 
-    for attempt in range(1, PROFILE_MAX_RETRIES + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            text = clean(getattr(response, "text", ""))
+    for model_name in models_to_try:
+        print(f"Trying Gemini model: {model_name}")
 
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE).strip()
-                text = re.sub(r"```$", "", text.strip()).strip()
+        for attempt in range(1, PROFILE_MAX_RETRIES + 1):
+            try:
+                return call_gemini_once(client, model_name, prompt)
 
-            parsed = json.loads(text)
-            return {field: clean(parsed.get(field, "")) for field in PROFILE_OUTPUT_FIELDS}
+            except Exception as e:
+                last_error = str(e)
 
-        except Exception as e:
-            last_error = str(e)
+                if looks_like_unavailable_error(last_error):
+                    print(
+                        f"Gemini model {model_name} unavailable "
+                        f"(attempt {attempt}/{PROFILE_MAX_RETRIES}): {last_error}"
+                    )
+                else:
+                    print(
+                        f"Gemini model {model_name} failed "
+                        f"(attempt {attempt}/{PROFILE_MAX_RETRIES}): {last_error}"
+                    )
 
-            if looks_like_unavailable_error(last_error):
-                print(f"Gemini temporarily unavailable (attempt {attempt}/{PROFILE_MAX_RETRIES}).")
-            else:
-                print(f"Gemini failed attempt {attempt}/{PROFILE_MAX_RETRIES}: {last_error}")
+                if looks_like_quota_error(last_error) and STOP_ON_QUOTA_EXHAUSTION:
+                    raise RuntimeError(
+                        f"Gemini failed on {model_name} after quota exhaustion: {last_error}"
+                    )
 
-            if attempt < PROFILE_MAX_RETRIES:
-                time.sleep(PROFILE_REQUEST_DELAY_SECONDS)
+                if attempt < PROFILE_MAX_RETRIES:
+                    wait_seconds = PROFILE_REQUEST_DELAY_SECONDS * attempt
+                    print(f"Waiting {wait_seconds:.1f}s before retry...")
+                    time.sleep(wait_seconds)
 
-    raise RuntimeError(f"Gemini failed after {PROFILE_MAX_RETRIES} retries: {last_error}")
+        print(f"Exhausted retries for model: {model_name}. Moving to next fallback model...")
+
+    raise RuntimeError(
+        f"Gemini failed across all configured models: {last_error}"
+    )
 
 
 # =========================
