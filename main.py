@@ -362,12 +362,11 @@ def main():
             existing_row = existing_by_legislator_and_url.get(key)
 
             if existing_row:
-                # preserve enrichment, but refresh timestamp to reflect current retained set
-                refreshed = pad_row(existing_row, 9)
-                refreshed[3] = now
-                rebuilt_rows.append(refreshed)
+                # preserve enrichment and preserve original captured timestamp
+                preserved = pad_row(existing_row, 9)
+                rebuilt_rows.append(preserved)
 
-                if bool_from_cell(refreshed[7]):
+                if bool_from_cell(preserved[7]):
                     kept_processed += 1
             else:
                 rebuilt_rows.append([
