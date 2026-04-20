@@ -24,12 +24,12 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run main collector
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          python main.py
+     # - name: Run main collector
+     #   env:
+     #     SHEET_ID: ${{ secrets.SHEET_ID }}
+     #     GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+     #   run: |
+     #     python main.py
 
     # - name: Run analyzer
     #   env:
@@ -54,11 +54,12 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: "gemini-2.5-flash"
+          FALLBACK_GEMINI_MODELS: "gemini-2.5-flash-lite,gemini-2.0-flash"
           MAX_BILLS_PER_LEGISLATOR: "12"
           MIN_SUBSTANTIVE_BILLS_REQUIRED: "4"
           MIN_TOTAL_ITEMS_REQUIRED: "6"
-          PROFILE_MAX_RETRIES: "2"
-          PROFILE_REQUEST_DELAY_SECONDS: "5"
+          PROFILE_MAX_RETRIES: "3"
+          PROFILE_REQUEST_DELAY_SECONDS: "8"
           STOP_ON_QUOTA_EXHAUSTION: "true"
           ONLY_LEGISLATOR: "Nancy Jenkins-Arno"
         run: |
