@@ -221,33 +221,40 @@ def parse_year_from_date(date_text: str) -> int | None:
     return int(match.group(1))
 
 
-def extract_previous_service_ranges(note: str) -> List[Tuple[int, int]]:
-    if not note:
-        return []
-
-    lowered = note.lower()
-    ranges: List[Tuple[int, int]] = []
-
-    patterns = [
-        r"previously served.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
-        r"prior service.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
-        r"prior house service.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
-        r"non-consecutive term.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+def extract_previous_service_ranges(row: Dict[str, str]) -> List[Tuple[int, int]]:
+    texts = [
+        row.get("Time_In_Office_Note", "") or "",
+        row.get("First_Elected_to_Current_Chamber", "") or "",
+        row.get("Time_In_Office_Summary", "") or "",
     ]
 
-    for pattern in patterns:
-        for start, end in re.findall(pattern, lowered):
-            start_year = int(start)
-            end_year = int(end)
-            if end_year >= start_year:
-                ranges.append((start_year, end_year))
+    ranges: List[Tuple[int, int]] = []
 
-    if not ranges:
-        for start, end in re.findall(r"(\d{4})\s*(?:-|–|to)\s*(\d{4})", lowered):
-            start_year = int(start)
-            end_year = int(end)
-            if end_year >= start_year:
-                ranges.append((start_year, end_year))
+    for text in texts:
+        lowered = text.lower()
+
+        patterns = [
+            r"previously served.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+            r"prior service.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+            r"prior house service.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+            r"returned after.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+            r"non-consecutive.*?(\d{4})\s*(?:-|–|to)\s*(\d{4})",
+        ]
+
+        for pattern in patterns:
+            for start, end in re.findall(pattern, lowered):
+                start_year = int(start)
+                end_year = int(end)
+                if end_year >= start_year:
+                    ranges.append((start_year, end_year))
+
+        # fallback: capture plain year ranges only if the text suggests prior service
+        if any(keyword in lowered for keyword in ["prior", "previous", "returned", "non-consecutive"]):
+            for start, end in re.findall(r"(\d{4})\s*(?:-|–|to)\s*(\d{4})", lowered):
+                start_year = int(start)
+                end_year = int(end)
+                if end_year >= start_year:
+                    ranges.append((start_year, end_year))
 
     deduped = []
     seen = set()
@@ -258,9 +265,9 @@ def extract_previous_service_ranges(note: str) -> List[Tuple[int, int]]:
 
     return deduped
 
-
 def estimate_legislative_service_years(row: Dict[str, str]) -> int | None:
     note = row.get("Time_In_Office_Note", "") or ""
+    first_elected_text = row.get("First_Elected_to_Current_Chamber", "") or ""
     current_term_start = row.get("Current_Term_Start", "") or ""
     current_term_end = row.get("Current_Term_End", "") or ""
 
@@ -272,15 +279,28 @@ def estimate_legislative_service_years(row: Dict[str, str]) -> int | None:
 
     current_term_years = end_year - start_year
 
-    since_match = re.search(r"since\s+(?:jan\.?\s*1,\s*)?(\d{4})", note, flags=re.IGNORECASE)
+    since_match = re.search(
+        r"since\s+(?:jan\.?\s*1,\s*)?(\d{4})",
+        note,
+        flags=re.IGNORECASE
+    )
     if since_match and "prior" not in note.lower() and "previous" not in note.lower():
         since_year = int(since_match.group(1))
         if end_year > since_year:
             return end_year - since_year
 
+    # also allow a simple continuous-service interpretation from first elected field
+    first_elected_year = parse_year_from_date(first_elected_text)
+    if first_elected_year and not any(
+        keyword in first_elected_text.lower()
+        for keyword in ["prior", "previous", "returned", "non-consecutive"]
+    ):
+        if end_year > first_elected_year:
+            return end_year - first_elected_year
+
     total_years = current_term_years
 
-    for prior_start, prior_end in extract_previous_service_ranges(note):
+    for prior_start, prior_end in extract_previous_service_ranges(row):
         total_years += (prior_end - prior_start + 1)
 
     return total_years
