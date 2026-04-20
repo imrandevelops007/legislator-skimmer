@@ -421,9 +421,14 @@ Do not include leading hyphens.
 Do not include line breaks inside field values unless absolutely necessary.
 Return JSON only.
 
+Important: LEO refers to the Department of Labor and Economic Opportunity (workforce and economic development), NOT law enforcement.
+
 Formatting rules by field:
 - Committee_Relevance_Summary:
+  Include ALL major committee assignments from metadata.
+  Prioritize leadership roles (Chair, Vice Chair).
   Store as: Committee::Why it matters || Committee::Why it matters
+  Do not return fewer than 3 committees unless fewer exist.
 - Time_In_Office_Summary:
   Store as: Item | Item | Item
 - Generated_Biography:
@@ -435,14 +440,18 @@ Formatting rules by field:
 - Legislative_Focus_Areas:
   Store as: Item | Item | Item
 - Key_Bills:
-  Store as: BILLNUMBER::Why it matters || BILLNUMBER::Why it matters
-  If there is no bill number, use a short title instead.
+  Always use official bill numbers when available.
+  Do NOT use generic labels like "Joint resolution".
+  If no bill number exists, create a short descriptive label.
 - Political_Positioning:
   Store as one short line like: Democratic | Leadership-oriented | Business-informed
 - Political_Positioning_Bullets:
   Store as: Item | Item | Item
 - SBDC_Framing:
-  Store as one concise paragraph with no markdown
+  Write from an outreach perspective.
+  Focus on why this legislator matters to SBDC, and why the SBDC should matter to the legislator.
+  Mention funding, workforce, economic development, or small business impact.
+  Avoid generic biography language.
 - Talking_Points:
   Store as: Item | Item | Item | Item
 
