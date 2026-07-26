@@ -37,7 +37,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DRY_RUN: "false"
-          GEMINI_MODEL: "gemini-2.5-flash"
+          GEMINI_MODEL: "gemini-2.0-flash"
           BATCH_SIZE: "5"
           MAX_ITEMS_PER_RUN: "5"
           MAX_PAGE_CHARS: "2500"
@@ -55,8 +55,8 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-2.5-flash"
-          FALLBACK_GEMINI_MODELS: "gemini-2.5-flash-lite,gemini-2.0-flash"
+          GEMINI_MODEL: "gemini-2.0-flash"
+          FALLBACK_GEMINI_MODELS: "gemini-2.0-flash-lite,gemini-1.5-flash"
           MAX_BILLS_PER_LEGISLATOR: "12"
           MIN_SUBSTANTIVE_BILLS_REQUIRED: "4"
           MIN_TOTAL_ITEMS_REQUIRED: "6"
@@ -78,3 +78,10 @@ jobs:
           ONLY_LEGISLATOR: ""
         run: |
           python report_generator.py
+
+      - name: Upload PDF Reports as Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: legislator-briefing-sheets
+          path: generated_reports/
+          retention-days: 5
