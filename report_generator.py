@@ -248,7 +248,6 @@ def extract_previous_service_ranges(row: Dict[str, str]) -> List[Tuple[int, int]
                 if end_year >= start_year:
                     ranges.append((start_year, end_year))
 
-        # fallback: capture plain year ranges only if the text suggests prior service
         if any(keyword in lowered for keyword in ["prior", "previous", "returned", "non-consecutive"]):
             for start, end in re.findall(r"(\d{4})\s*(?:-|–|to)\s*(\d{4})", lowered):
                 start_year = int(start)
@@ -289,7 +288,6 @@ def estimate_legislative_service_years(row: Dict[str, str]) -> int | None:
         if end_year > since_year:
             return end_year - since_year
 
-    # also allow a simple continuous-service interpretation from first elected field
     first_elected_year = parse_year_from_date(first_elected_text)
     if first_elected_year and not any(
         keyword in first_elected_text.lower()
@@ -453,9 +451,6 @@ def load_profiles(service) -> Dict[str, Dict[str, str]]:
 
 
 def resolve_template_path() -> tuple[str, str]:
-    """
-    Returns (template_dir, template_name)
-    """
     candidates = []
 
     if TEMPLATE_DIR:
@@ -549,6 +544,7 @@ def upload_pdf_to_drive(drive_service, local_path: str, filename: str, folder_id
             media_body=media,
             fields="id, name, webViewLink",
             supportsAllDrives=True,
+            supportsTeamDrives=True,
         )
         .execute()
     )
