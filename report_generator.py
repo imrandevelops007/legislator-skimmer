@@ -544,7 +544,6 @@ def upload_pdf_to_drive(drive_service, local_path: str, filename: str, folder_id
             media_body=media,
             fields="id, name, webViewLink",
             supportsAllDrives=True,
-            supportsTeamDrives=True,
         )
         .execute()
     )

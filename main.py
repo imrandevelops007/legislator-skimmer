@@ -1,4 +1,3 @@
-
 import os
 import json
 import re
@@ -300,7 +299,6 @@ def main():
     configured_names = [name for name, _, _ in legislators]
     configured_set = set(configured_names)
 
-    # Group existing rows by legislator and url so we can preserve enriched data
     existing_by_legislator_and_url: dict[tuple[str, str], list[str]] = {}
     existing_urls_by_legislator: dict[str, list[str]] = {}
 
@@ -342,7 +340,6 @@ def main():
         except Exception as e:
             print(f"Failed to collect legislature search results: {e}")
 
-            # preserve existing rows for this legislator if collection fails
             existing_rows_for_legislator = [
                 existing_by_legislator_and_url[(name, url)]
                 for url in existing_urls_by_legislator.get(name, [])
@@ -363,7 +360,6 @@ def main():
             existing_row = existing_by_legislator_and_url.get(key)
 
             if existing_row:
-                # preserve enrichment and preserve original captured timestamp
                 preserved = pad_row(existing_row, 9)
                 rebuilt_rows.append(preserved)
 
@@ -391,7 +387,6 @@ def main():
             f"Preserved processed={kept_processed}."
         )
 
-    # Preserve any rows for legislators not currently in config
     other_rows = [
         row for row in activity_rows
         if clean(row[1]) not in configured_set
@@ -400,12 +395,13 @@ def main():
         print(f"\nPreserving {len(other_rows)} row(s) for non-configured legislator(s).")
         rebuilt_rows.extend(other_rows)
 
-    # Rewrite Activity_Items body
-    sheets_clear(service, ACTIVITY_RANGE_ALL)
+    # Safety check: Only clear and rebuild if new links were actually collected
     if rebuilt_rows:
+        sheets_clear(service, ACTIVITY_RANGE_ALL)
         sheets_update_values(service, ACTIVITY_RANGE_ALL, rebuilt_rows)
-
-    print(f"\nRebuilt Activity_Items with {len(rebuilt_rows)} total row(s).")
+        print(f"\nRebuilt Activity_Items with {len(rebuilt_rows)} total row(s).")
+    else:
+        print("\nWarning: No bill links collected. Preserving existing Activity_Items data.")
 
     if changed_legislators:
         print(f"Marking {len(changed_legislators)} legislator profile(s) for rebuild.")
