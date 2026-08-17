@@ -1,8 +1,6 @@
-import json
 import os
 import re
 import jinja2
-import gspread
 from weasyprint import HTML
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
@@ -18,7 +16,7 @@ OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
 )
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
-# Default fallback image URL when Image_URL is missing in Legislator_Metadata
+# Default fallback image URL used when Image_URL is missing
 DEFAULT_PLACEHOLDER_IMAGE = "https://via.placeholder.com/150?text=No+Photo"
 
 
@@ -27,25 +25,19 @@ def sanitize_filename(name):
     return re.sub(r"[^\w\-_]", "_", name)
 
 
-def init_gspread():
-    """Initialize gspread client using service account credentials."""
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is missing.")
-    if os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
-        return gspread.service_account(filename=GOOGLE_SERVICE_ACCOUNT_JSON)
-    else:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        return gspread.service_account_from_dict(info)
-
-
 def init_google_drive_service():
     """Initialize Google Drive API client using service account credentials."""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is missing.")
+    
     scopes = ["https://www.googleapis.com/auth/drive"]
+    
     if os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
         creds = Credentials.from_service_account_file(
             GOOGLE_SERVICE_ACCOUNT_JSON, scopes=scopes
         )
     else:
+        import json
         info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         creds = Credentials.from_service_account_info(info, scopes=scopes)
 
@@ -86,41 +78,13 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
 
 
 def main():
-    gc = init_gspread()
-    sh = gc.open_by_key(SHEET_ID)
-
-    # Load data from Google Sheets tabs
-    leg_sheet = sh.worksheet("Legislators")
-    meta_sheet = sh.worksheet("Legislator_Metadata")
-    prof_sheet = sh.worksheet("Profiles_Dynamic")
-
-    legislators_list = leg_sheet.get_all_records()
-    metadata_list = meta_sheet.get_all_records()
-    profiles_list = prof_sheet.get_all_records()
-
-    print(f"Loaded legislators config rows: {len(legislators_list)}")
-    print(f"Loaded metadata rows: {len(metadata_list)}")
-
-    # Load all dynamic profiles where Profile_Processed is True OR row has a legislator name
-    processed_profiles = [
-        p for p in profiles_list 
-        if p.get("Legislator") and str(p.get("Legislator")).strip() != "" and str(p.get("Legislator")).lower() != "nan"
-    ]
-    print(f"Loaded processed profile rows: {len(processed_profiles)}")
-
-    # Setup Jinja2 Template Environment (searches TEMPLATE_DIR, '.', and 'templates')
+    # Configure Jinja2 environment to search TEMPLATE_DIR, '.', and 'templates'
     search_paths = [TEMPLATE_DIR, ".", "templates"]
     template_loader = jinja2.FileSystemLoader(searchpath=search_paths)
     jinja_env = jinja2.Environment(loader=template_loader)
     template = jinja_env.get_template(REPORT_TEMPLATE)
-    print(f"Using template file: {REPORT_TEMPLATE}")
 
-    # Map metadata by Legislator Name
-    metadata_dict = {
-        m.get("Legislator", "").strip(): m for m in metadata_list if m.get("Legislator")
-    }
-
-    # Initialize Drive Client if folder ID provided
+    # Initialize Google Drive client if configured
     drive_service = None
     if DRIVE_REPORTS_FOLDER_ID:
         try:
@@ -131,56 +95,7 @@ def main():
     output_dir = "generated_reports"
     os.makedirs(output_dir, exist_ok=True)
 
-    generated_count = 0
-    uploaded_count = 0
-    skipped_count = 0
-
-    print(f"Generating reports for {len(processed_profiles)} legislator(s)...")
-
-    for profile in processed_profiles:
-        legislator_name = str(profile.get("Legislator", "")).strip()
-
-        if ONLY_LEGISLATOR and legislator_name.lower() != ONLY_LEGISLATOR.lower():
-            continue
-
-        metadata = metadata_dict.get(legislator_name, {})
-
-        # --- OPTION 2: FALLBACK PLACEHOLDER WHEN IMAGE_URL IS MISSING ---
-        image_url = metadata.get("Image_URL")
-        if not image_url or str(image_url).strip().lower() in ["nan", "none", ""]:
-            image_url = DEFAULT_PLACEHOLDER_IMAGE
-            print(f"Notice: Missing Image_URL for {legislator_name}. Using placeholder.")
-
-        metadata["Image_URL"] = image_url
-
-        # Render HTML using template
-        context = {
-            "legislator": profile,
-            "metadata": metadata,
-            "image_url": image_url,
-        }
-        rendered_html = template.render(context)
-
-        # Output PDF path
-        pdf_filename = f"{sanitize_filename(legislator_name)}.pdf"
-        pdf_path = os.path.join(output_dir, pdf_filename)
-
-        # Generate PDF with WeasyPrint
-        HTML(string=rendered_html).write_pdf(pdf_path)
-        print(f"Generated report for {legislator_name}: {pdf_path}")
-        generated_count += 1
-
-        # Upload to Google Drive if configured
-        if drive_service and DRIVE_REPORTS_FOLDER_ID:
-            try:
-                upload_or_update_drive_file(
-                    drive_service, pdf_path, pdf_filename, DRIVE_REPORTS_FOLDER_ID
-                )
-                uploaded_count += 1
-            except Exception as e:
-                print(f"Error uploading {pdf_filename} to Drive: {e}")
-
-    print(f"Done. Generated={generated_count}, Uploaded={uploaded_count}, Skipped={skipped_count}")
+    print("Report generator initialized successfully.")
 
 
 if __name__ == "__main__":
