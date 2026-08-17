@@ -1,85 +1,75 @@
-name: Skim legislator sites
+name: Run Legislator Intelligence Pipeline
 
 on:
-  schedule:
-    - cron: "0 17 * * *"
   workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
 
 jobs:
   run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run main collector
+      - name: Run Main Processing Pipeline
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          python main.py
+        run: python main.py
 
-      - name: Run analyzer
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          DRY_RUN: "false"
-          GEMINI_MODEL: "gemini-2.5-flash"
-          BATCH_SIZE: "1"
-          MAX_ITEMS_PER_RUN: "2"
-          MAX_PAGE_CHARS: "2500"
-          GEMINI_MAX_RETRIES: "3"
-          REQUEST_DELAY_SECONDS: "15"
-          STOP_ON_QUOTA_EXHAUSTION: "true"
-          REPAIR_MISSING_BILL_NUMBERS: "true"
-          ONLY_LEGISLATOR: ""
-
-        run: |
-          python analyze.py
-
-      - name: Run profile builder
+      - name: Run Analysis
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-2.5-flash"
-          FALLBACK_GEMINI_MODELS: "gemini-2.5-flash-lite,gemini-1.5-flash"
-          MAX_BILLS_PER_LEGISLATOR: "12"
-          MIN_SUBSTANTIVE_BILLS_REQUIRED: "4"
-          MIN_TOTAL_ITEMS_REQUIRED: "6"
-          PROFILE_MAX_RETRIES: "3"
-          PROFILE_REQUEST_DELAY_SECONDS: "15"
-          STOP_ON_QUOTA_EXHAUSTION: "true"
-          ONLY_LEGISLATOR: ""
-        run: |
-          python profile_builder.py
+          GEMINI_MODEL: 'gemini-3.6-flash'
+          DRY_RUN: 'false'
+          BATCH_SIZE: 1
+          MAX_ITEMS_PER_RUN: 2
+          MAX_PAGE_CHARS: 2500
+          GEMINI_MAX_RETRIES: 3
+          REQUEST_DELAY_SECONDS: 15
+          STOP_ON_QUOTA_EXHAUSTION: 'true'
+          REPAIR_MISSING_BILL_NUMBERS: 'true'
+        run: python analyze.py
 
-      - name: Generate and upload reports
+      - name: Run Profile Builder
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: 'gemini-3.6-flash'
+          FALLBACK_GEMINI_MODELS: 'gemini-3.5-flash,gemini-3.5-flash-lite'
+          MAX_BILLS_PER_LEGISLATOR: 12
+          MIN_SUBSTANTIVE_BILLS_REQUIRED: 4
+          MIN_TOTAL_ITEMS_REQUIRED: 6
+          PROFILE_MAX_RETRIES: 3
+          PROFILE_REQUEST_DELAY_SECONDS: 15
+          STOP_ON_QUOTA_EXHAUSTION: 'true'
+        run: python profile_builder.py
+
+      - name: Run Report Generator
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           DRIVE_REPORTS_FOLDER_ID: ${{ secrets.DRIVE_REPORTS_FOLDER_ID }}
-          TEMPLATE_DIR: "."
-          REPORT_TEMPLATE: "report.html"
-          OVERWRITE_EXISTING_IN_TARGET_FOLDER: "true"
-          ONLY_LEGISLATOR: ""
-        run: |
-          python report_generator.py
+          TEMPLATE_DIR: '.'
+          REPORT_TEMPLATE: 'report.html'
+          OVERWRITE_EXISTING_IN_TARGET_FOLDER: 'true'
+        run: python report_generator.py
 
-      - name: Upload PDF Reports as Artifacts
+      - name: Upload Briefing Sheets Artifact
         uses: actions/upload-artifact@v4
         with:
           name: legislator-briefing-sheets
