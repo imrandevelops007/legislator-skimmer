@@ -10,8 +10,8 @@ SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-FALLBACK_GEMINI_MODELS = os.getenv("FALLBACK_GEMINI_MODELS", "gemini-1.5-flash").split(",")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+FALLBACK_GEMINI_MODELS = os.getenv("FALLBACK_GEMINI_MODELS", "gemini-3.5-flash,gemini-3.5-flash-lite").split(",")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def get_sheets_service():
