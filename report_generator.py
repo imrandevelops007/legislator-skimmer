@@ -45,7 +45,8 @@ def init_google_services():
         creds = Credentials.from_service_account_info(info, scopes=scopes)
 
     drive_service = build("drive", "v3", credentials=creds)
-    sheets_service = build("sheets", "4", credentials=creds)
+    # FIX: Changed "4" to "v4"
+    sheets_service = build("sheets", "v4", credentials=creds)
     return drive_service, sheets_service
 
 
@@ -61,7 +62,7 @@ def fetch_sheet_records(sheets_service, sheet_id, range_name):
     if not rows:
         return []
     
-    headers = [str(h).strip() for m in [rows[0]] for h in m]
+    headers = [str(h).strip() for h in rows[0]]
     records = []
     for row in rows[1:]:
         record = {}
