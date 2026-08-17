@@ -19,7 +19,7 @@ OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
 )
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
-# Default fallback image URL when Image_URL is missing in Legislator_Metadata
+# Default fallback image URL when Image_URL is missing
 DEFAULT_PLACEHOLDER_IMAGE = "https://via.placeholder.com/150?text=No+Photo"
 
 
@@ -74,31 +74,32 @@ def fetch_sheet_records(sheets_service, sheet_id, range_name):
 
 
 def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
-    """Upload a PDF report to Google Drive or update it if it already exists."""
+    """Upload a PDF report to Google Drive or overwrite it in the existing folder."""
     query = f"'{folder_id}' in parents and name = '{file_name}' and trashed = false"
     response = drive_service.files().list(q=query, fields="files(id, name)").execute()
     files = response.get("files", [])
 
     media = MediaFileUpload(file_path, mimetype="application/pdf", resumable=True)
 
+    # Attempt to update if file exists
     if files and OVERWRITE_EXISTING_IN_TARGET_FOLDER:
         file_id = files[0]["id"]
         try:
-            print(f"Updating existing Drive file in target folder: {file_name} ({file_id})")
+            print(f"Updating existing Drive file: {file_name} ({file_id})")
             updated_file = (
                 drive_service.files()
                 .update(fileId=file_id, media_body=media, fields="id, webViewLink")
                 .execute()
             )
-            print(f"Updated in Drive: {file_name} ({updated_file.get('id')})")
-            print(f"Drive link: {updated_file.get('webViewLink')}")
+            print(f"Updated in Drive: {file_name}")
             return updated_file.get("webViewLink")
         except HttpError as e:
             if e.resp.status in [403, 404]:
-                print(f"Old file ID {file_id} not writable/found in Drive. Uploading new file into target folder...")
+                print(f"File ID {file_id} not writable or found ({e.resp.status}). Creating fresh file in target folder...")
             else:
                 raise e
 
+    # Fallback: Create/upload new file into target folder
     file_metadata = {"name": file_name, "parents": [folder_id]}
     created_file = (
         drive_service.files()
@@ -106,7 +107,6 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
         .execute()
     )
     print(f"Uploaded to Drive: {file_name} ({created_file.get('id')})")
-    print(f"Drive link: {created_file.get('webViewLink')}")
     return created_file.get("webViewLink")
 
 
@@ -160,7 +160,6 @@ def main():
 
         metadata["Image_URL"] = image_url
 
-        # Build combined context dictionary matching template variable keys
         context = {
             "legislator": profile,
             "metadata": metadata,
