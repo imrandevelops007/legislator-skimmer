@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import jinja2
@@ -16,6 +17,7 @@ OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
 )
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
+# Default placeholder image URL used when Image_URL is missing in Legislator_Metadata
 DEFAULT_PLACEHOLDER_IMAGE = "https://via.placeholder.com/150?text=No+Photo"
 
 
@@ -24,23 +26,49 @@ def sanitize_filename(name):
     return re.sub(r"[^\w\-_]", "_", name)
 
 
-def init_google_drive_service():
-    """Initialize Google Drive API client using service account credentials."""
+def init_google_services():
+    """Initialize Sheets and Drive API clients using service account credentials."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is missing.")
     
-    scopes = ["https://www.googleapis.com/auth/drive"]
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets.readonly"
+    ]
     
     if os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
         creds = Credentials.from_service_account_file(
             GOOGLE_SERVICE_ACCOUNT_JSON, scopes=scopes
         )
     else:
-        import json
         info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         creds = Credentials.from_service_account_info(info, scopes=scopes)
 
-    return build("drive", "v3", credentials=creds)
+    drive_service = build("drive", "v3", credentials=creds)
+    sheets_service = build("sheets", "4", credentials=creds)
+    return drive_service, sheets_service
+
+
+def fetch_sheet_records(sheets_service, sheet_id, range_name):
+    """Fetch rows from Google Sheet tab and convert to list of dictionaries."""
+    result = (
+        sheets_service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=range_name)
+        .execute()
+    )
+    rows = result.get("values", [])
+    if not rows:
+        return []
+    
+    headers = [str(h).strip() for m in [rows[0]] for h in m]
+    records = []
+    for row in rows[1:]:
+        record = {}
+        for idx, header in enumerate(headers):
+            record[header] = row[idx] if idx < len(row) else ""
+        records.append(record)
+    return records
 
 
 def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
@@ -76,51 +104,54 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
         return created_file.get("webViewLink")
 
 
-# Note: In your repository, load_sheet_data reads your sheets via your existing helper.
-# Ensure main() calls your original sheet loader and iterates over all 18 rows:
-
 def main():
+    drive_service, sheets_service = init_google_services()
+
+    # Load records from Google Sheets
+    legislators = fetch_sheet_records(sheets_service, SHEET_ID, "Legislators!A1:Z")
+    metadata_list = fetch_sheet_records(sheets_service, SHEET_ID, "Legislator_Metadata!A1:Z")
+    profiles = fetch_sheet_records(sheets_service, SHEET_ID, "Profiles_Dynamic!A1:Z")
+
+    print(f"Loaded legislators config rows: {len(legislators)}")
+    print(f"Loaded metadata rows: {len(metadata_list)}")
+
+    # Filter profile records with valid legislator names
+    processed_profiles = [
+        p for p in profiles 
+        if p.get("Legislator") and str(p.get("Legislator")).strip() != "" and str(p.get("Legislator")).lower() != "nan"
+    ]
+    print(f"Loaded processed profile rows: {len(processed_profiles)}")
+
+    # Configure Jinja2 environment to search search_paths
     search_paths = [TEMPLATE_DIR, ".", "templates"]
     template_loader = jinja2.FileSystemLoader(searchpath=search_paths)
     jinja_env = jinja2.Environment(loader=template_loader)
     template = jinja_env.get_template(REPORT_TEMPLATE)
+    print(f"Using template file: {REPORT_TEMPLATE}")
 
-    drive_service = None
-    if DRIVE_REPORTS_FOLDER_ID:
-        try:
-            drive_service = init_google_drive_service()
-        except Exception as e:
-            print(f"Warning: Google Drive service failed to initialize: {e}")
+    # Map metadata dictionary by Legislator Name
+    metadata_dict = {
+        str(m.get("Legislator", "")).strip(): m for m in metadata_list if m.get("Legislator")
+    }
 
     output_dir = "generated_reports"
     os.makedirs(output_dir, exist_ok=True)
-
-    # Replace with your project's original sheet loader calls:
-    # legislators = load_legislators()
-    # metadata_dict = load_metadata()
-    # profiles = load_profiles()
-
-    print(f"Loaded legislators config rows: {len(legislators)}")
-    print(f"Loaded metadata rows: {len(metadata_dict)}")
-    print(f"Loaded processed profile rows: {len(profiles)}")
-    print(f"Using template file: {REPORT_TEMPLATE}")
-    print(f"Generating reports for {len(profiles)} legislator(s)...")
 
     generated_count = 0
     uploaded_count = 0
     skipped_count = 0
 
-    for profile in profiles:
-        legislator_name = profile.get("Legislator", "").strip()
-        if not legislator_name or legislator_name.lower() == "nan":
-            continue
+    print(f"Generating reports for {len(processed_profiles)} legislator(s)...")
+
+    for profile in processed_profiles:
+        legislator_name = str(profile.get("Legislator", "")).strip()
 
         if ONLY_LEGISLATOR and legislator_name.lower() != ONLY_LEGISLATOR.lower():
             continue
 
         metadata = metadata_dict.get(legislator_name, {})
 
-        # FIX: Fallback to placeholder image instead of skipping when Image_URL is missing
+        # Fallback to default placeholder image when Image_URL is missing
         image_url = metadata.get("Image_URL")
         if not image_url or str(image_url).strip().lower() in ["nan", "none", ""]:
             image_url = DEFAULT_PLACEHOLDER_IMAGE
