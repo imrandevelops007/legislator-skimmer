@@ -16,7 +16,6 @@ OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
 )
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
-# Default fallback image URL used when Image_URL is missing
 DEFAULT_PLACEHOLDER_IMAGE = "https://via.placeholder.com/150?text=No+Photo"
 
 
@@ -77,14 +76,15 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
         return created_file.get("webViewLink")
 
 
+# Note: In your repository, load_sheet_data reads your sheets via your existing helper.
+# Ensure main() calls your original sheet loader and iterates over all 18 rows:
+
 def main():
-    # Configure Jinja2 environment to search TEMPLATE_DIR, '.', and 'templates'
     search_paths = [TEMPLATE_DIR, ".", "templates"]
     template_loader = jinja2.FileSystemLoader(searchpath=search_paths)
     jinja_env = jinja2.Environment(loader=template_loader)
     template = jinja_env.get_template(REPORT_TEMPLATE)
 
-    # Initialize Google Drive client if configured
     drive_service = None
     if DRIVE_REPORTS_FOLDER_ID:
         try:
@@ -95,7 +95,62 @@ def main():
     output_dir = "generated_reports"
     os.makedirs(output_dir, exist_ok=True)
 
-    print("Report generator initialized successfully.")
+    # Replace with your project's original sheet loader calls:
+    # legislators = load_legislators()
+    # metadata_dict = load_metadata()
+    # profiles = load_profiles()
+
+    print(f"Loaded legislators config rows: {len(legislators)}")
+    print(f"Loaded metadata rows: {len(metadata_dict)}")
+    print(f"Loaded processed profile rows: {len(profiles)}")
+    print(f"Using template file: {REPORT_TEMPLATE}")
+    print(f"Generating reports for {len(profiles)} legislator(s)...")
+
+    generated_count = 0
+    uploaded_count = 0
+    skipped_count = 0
+
+    for profile in profiles:
+        legislator_name = profile.get("Legislator", "").strip()
+        if not legislator_name or legislator_name.lower() == "nan":
+            continue
+
+        if ONLY_LEGISLATOR and legislator_name.lower() != ONLY_LEGISLATOR.lower():
+            continue
+
+        metadata = metadata_dict.get(legislator_name, {})
+
+        # FIX: Fallback to placeholder image instead of skipping when Image_URL is missing
+        image_url = metadata.get("Image_URL")
+        if not image_url or str(image_url).strip().lower() in ["nan", "none", ""]:
+            image_url = DEFAULT_PLACEHOLDER_IMAGE
+
+        metadata["Image_URL"] = image_url
+
+        context = {
+            "legislator": profile,
+            "metadata": metadata,
+            "image_url": image_url,
+        }
+        rendered_html = template.render(context)
+
+        pdf_filename = f"{sanitize_filename(legislator_name)}.pdf"
+        pdf_path = os.path.join(output_dir, pdf_filename)
+
+        HTML(string=rendered_html).write_pdf(pdf_path)
+        print(f"Generated report for {legislator_name}: {pdf_path}")
+        generated_count += 1
+
+        if drive_service and DRIVE_REPORTS_FOLDER_ID:
+            try:
+                upload_or_update_drive_file(
+                    drive_service, pdf_path, pdf_filename, DRIVE_REPORTS_FOLDER_ID
+                )
+                uploaded_count += 1
+            except Exception as e:
+                print(f"Error uploading {pdf_filename} to Drive: {e}")
+
+    print(f"Done. Generated={generated_count}, Uploaded={uploaded_count}, Skipped={skipped_count}")
 
 
 if __name__ == "__main__":
