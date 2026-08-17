@@ -95,11 +95,11 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
             return updated_file.get("webViewLink")
         except HttpError as e:
             if e.resp.status == 404:
-                print(f"File ID {file_id} not writable by Service Account. Re-uploading into target folder...")
+                print(f"Old file ID {file_id} not writable/found in Drive. Uploading new file into target folder...")
             else:
                 raise e
 
-    # Fallback to creating/uploading into target folder
+    # Fallback: Create/upload new file into target folder
     file_metadata = {"name": file_name, "parents": [folder_id]}
     created_file = (
         drive_service.files()
@@ -128,7 +128,7 @@ def main():
     ]
     print(f"Loaded processed profile rows: {len(processed_profiles)}")
 
-    # Configure Jinja2 environment
+    # Configure Jinja2 environment to search template directories
     search_paths = [TEMPLATE_DIR, ".", "templates"]
     template_loader = jinja2.FileSystemLoader(searchpath=search_paths)
     jinja_env = jinja2.Environment(loader=template_loader)
