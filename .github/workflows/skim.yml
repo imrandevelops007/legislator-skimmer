@@ -33,14 +33,13 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: 'gemini-3.6-flash'
+          GEMINI_MODEL: 'gemini-2.0-flash'
           DRY_RUN: 'false'
           BATCH_SIZE: 5
-          # Increased from 2 to 500 so analyze.py reaches rows 358-407
-          MAX_ITEMS_PER_RUN: 500
+          MAX_ITEMS_PER_RUN: 30
           MAX_PAGE_CHARS: 2500
           GEMINI_MAX_RETRIES: 3
-          REQUEST_DELAY_SECONDS: 2
+          REQUEST_DELAY_SECONDS: 10
           STOP_ON_QUOTA_EXHAUSTION: 'true'
           REPAIR_MISSING_BILL_NUMBERS: 'true'
         run: python analyze.py
@@ -50,8 +49,8 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: 'gemini-3.6-flash'
-          FALLBACK_GEMINI_MODELS: 'gemini-3.5-flash,gemini-3.5-flash-lite'
+          GEMINI_MODEL: 'gemini-2.0-flash'
+          FALLBACK_GEMINI_MODELS: 'gemini-1.5-flash'
           MAX_BILLS_PER_LEGISLATOR: 12
           MIN_SUBSTANTIVE_BILLS_REQUIRED: 4
           MIN_TOTAL_ITEMS_REQUIRED: 6
