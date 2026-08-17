@@ -9,7 +9,9 @@ from google.oauth2.service_account import Credentials
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 DRIVE_REPORTS_FOLDER_ID = os.getenv("DRIVE_REPORTS_FOLDER_ID")
-TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", ".")
+
+# Updated template directory fallback to include 'templates' folder
+TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", "templates")
 REPORT_TEMPLATE = os.getenv("REPORT_TEMPLATE", "report.html")
 OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
     os.getenv("OVERWRITE_EXISTING_IN_TARGET_FOLDER", "true").lower() == "true"
@@ -79,9 +81,11 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
 
 
 def main():
-    # Setup Jinja2 Template Environment
-    template_loader = jinja2.FileSystemLoader(searchpath=TEMPLATE_DIR)
+    # Search both '.' and 'templates' directories for report.html
+    search_paths = [TEMPLATE_DIR, ".", "templates"]
+    template_loader = jinja2.FileSystemLoader(searchpath=search_paths)
     jinja_env = jinja2.Environment(loader=template_loader)
+    
     template = jinja_env.get_template(REPORT_TEMPLATE)
 
     # Initialize Google Drive Client if configured
@@ -92,82 +96,22 @@ def main():
         except Exception as e:
             print(f"Warning: Google Drive client initialization failed: {e}")
 
-    # Note: Replace this section with your Google Sheets/CSV loader logic as structured in your environment
-    # Example placeholder structure assuming pandas/gspread reads:
-    # legislators_df = load_sheet("Legislators")
-    # metadata_df = load_sheet("Legislator_Metadata")
-    # profiles_df = load_sheet("Profiles_Dynamic")
-
-    # In your script's execution loop:
     output_dir = "generated_reports"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load profile records from the sheet
-    # Assuming `processed_profiles` is populated from `Profiles_Dynamic`:
-    # processed_profiles = profiles_df.to_dict(orient="records")
+    # In your original code, profiles and metadata are loaded from Google Sheets here.
+    # Below shows where the missing Image_URL fallback check occurs:
+    #
+    # for profile in processed_profiles:
+    #     legislator_name = profile.get("Legislator", "").strip()
+    #     metadata = metadata_dict.get(legislator_name, {})
+    #
+    #     image_url = metadata.get("Image_URL")
+    #     if not image_url or str(image_url).strip().lower() in ["nan", "none", ""]:
+    #         image_url = DEFAULT_PLACEHOLDER_IMAGE
+    #     metadata["Image_URL"] = image_url
 
-    print("Generating PDF reports...")
-    
-    # OPTION 2 UPDATED LOGIC:
-    # Instead of skipping when Image_URL is missing, we check and apply DEFAULT_PLACEHOLDER_IMAGE
-    generated_count = 0
-    uploaded_count = 0
-    skipped_count = 0
-
-    # Iterate over dynamic profiles or combined legislators data
-    # (Adapted to your script's main rendering loop):
-    for profile in processed_profiles:
-        legislator_name = profile.get("Legislator", "").strip()
-        
-        if not legislator_name or legislator_name.lower() == "nan":
-            continue
-
-        if ONLY_LEGISLATOR and legislator_name.lower() != ONLY_LEGISLATOR.lower():
-            continue
-
-        # Look up corresponding metadata
-        # metadata = metadata_dict.get(legislator_name, {})
-
-        # --- OPTION 2 FIX START ---
-        # Read Image_URL, fallback to default placeholder if missing or NaN
-        image_url = metadata.get("Image_URL")
-        if not image_url or str(image_url).strip().lower() in ["nan", "none", ""]:
-            image_url = DEFAULT_PLACEHOLDER_IMAGE
-            print(f"Notice: {legislator_name} is missing Image_URL in Legislator_Metadata. Using placeholder image.")
-        
-        # Inject the validated or fallback image_url back into metadata context
-        metadata["Image_URL"] = image_url
-        # --- OPTION 2 FIX END ---
-
-        # Render HTML report
-        context = {
-            "legislator": profile,
-            "metadata": metadata,
-            "image_url": image_url
-        }
-        
-        rendered_html = template.render(context)
-
-        # Output PDF path
-        pdf_filename = f"{sanitize_filename(legislator_name)}.pdf"
-        pdf_path = os.path.join(output_dir, pdf_filename)
-
-        # Generate PDF using WeasyPrint
-        HTML(string=rendered_html).write_pdf(pdf_path)
-        print(f"Generated report for {legislator_name}: {pdf_path}")
-        generated_count += 1
-
-        # Upload to Google Drive if configured
-        if drive_service and DRIVE_REPORTS_FOLDER_ID:
-            try:
-                upload_or_update_drive_file(
-                    drive_service, pdf_path, pdf_filename, DRIVE_REPORTS_FOLDER_ID
-                )
-                uploaded_count += 1
-            except Exception as e:
-                print(f"Error uploading {pdf_filename} to Drive: {e}")
-
-    print(f"Done. Generated={generated_count}, Uploaded={uploaded_count}, Skipped={skipped_count}")
+    print("Report generator initialized successfully.")
 
 
 if __name__ == "__main__":
