@@ -4,6 +4,8 @@ import re
 import jinja2
 from weasyprint import HTML
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 
 # Configuration loaded from environment variables
@@ -26,20 +28,16 @@ def sanitize_filename(name):
     return re.sub(r"[^\w\-_]", "_", name)
 
 
-def init_gspread():
-    """Initialize gspread client using service account credentials."""
+def init_google_services():
+    """Initialize Sheets and Drive API clients using service account credentials."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is missing.")
-    if os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
-        return gspread.service_account(filename=GOOGLE_SERVICE_ACCOUNT_JSON)
-    else:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        return gspread.service_account_from_dict(info)
-
-
-def init_google_drive_service():
-    """Initialize Google Drive API client using service account credentials."""
-    scopes = ["https://www.googleapis.com/auth/drive"]
+    
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets.readonly"
+    ]
+    
     if os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
         creds = Credentials.from_service_account_file(
             GOOGLE_SERVICE_ACCOUNT_JSON, scopes=scopes
@@ -48,7 +46,31 @@ def init_google_drive_service():
         info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         creds = Credentials.from_service_account_info(info, scopes=scopes)
 
-    return build("drive", "v3", credentials=creds)
+    drive_service = build("drive", "v3", credentials=creds)
+    sheets_service = build("sheets", "v4", credentials=creds)
+    return drive_service, sheets_service
+
+
+def fetch_sheet_records(sheets_service, sheet_id, range_name):
+    """Fetch rows from Google Sheet tab and convert to list of dictionaries."""
+    result = (
+        sheets_service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=range_name)
+        .execute()
+    )
+    rows = result.get("values", [])
+    if not rows:
+        return []
+    
+    headers = [str(h).strip() for h in rows[0]]
+    records = []
+    for row in rows[1:]:
+        record = {}
+        for idx, header in enumerate(headers):
+            record[header] = row[idx] if idx < len(row) else ""
+        records.append(record)
+    return records
 
 
 def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
@@ -57,11 +79,8 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
     response = drive_service.files().list(q=query, fields="files(id, name)").execute()
     files = response.get("files", [])
 
-    from googleapiclient.http import MediaFileUpload
-
     media = MediaFileUpload(file_path, mimetype="application/pdf", resumable=True)
 
-    # Attempt to update if file exists
     if files and OVERWRITE_EXISTING_IN_TARGET_FOLDER:
         file_id = files[0]["id"]
         try:
@@ -74,10 +93,12 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
             print(f"Updated in Drive: {file_name} ({updated_file.get('id')})")
             print(f"Drive link: {updated_file.get('webViewLink')}")
             return updated_file.get("webViewLink")
-        except Exception as e:
-            print(f"Update failed for {file_name} ({e}). Creating new file in target folder instead...")
+        except HttpError as e:
+            if e.resp.status in [403, 404]:
+                print(f"Old file ID {file_id} not writable/found in Drive. Uploading new file into target folder...")
+            else:
+                raise e
 
-    # Fallback to creating/uploading into target folder
     file_metadata = {"name": file_name, "parents": [folder_id]}
     created_file = (
         drive_service.files()
@@ -90,22 +111,18 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
 
 
 def main():
-    gc = init_gspread()
-    sh = gc.open_by_key(SHEET_ID)
+    drive_service, sheets_service = init_google_services()
 
-    leg_sheet = sh.worksheet("Legislators")
-    meta_sheet = sh.worksheet("Legislator_Metadata")
-    prof_sheet = sh.worksheet("Profiles_Dynamic")
+    # Load records from Google Sheets
+    legislators = fetch_sheet_records(sheets_service, SHEET_ID, "Legislators!A1:Z")
+    metadata_list = fetch_sheet_records(sheets_service, SHEET_ID, "Legislator_Metadata!A1:Z")
+    profiles = fetch_sheet_records(sheets_service, SHEET_ID, "Profiles_Dynamic!A1:Z")
 
-    legislators_list = leg_sheet.get_all_records()
-    metadata_list = meta_sheet.get_all_records()
-    profiles_list = prof_sheet.get_all_records()
-
-    print(f"Loaded legislators config rows: {len(legislators_list)}")
+    print(f"Loaded legislators config rows: {len(legislators)}")
     print(f"Loaded metadata rows: {len(metadata_list)}")
 
     processed_profiles = [
-        p for p in profiles_list 
+        p for p in profiles 
         if p.get("Legislator") and str(p.get("Legislator")).strip() != "" and str(p.get("Legislator")).lower() != "nan"
     ]
     print(f"Loaded processed profile rows: {len(processed_profiles)}")
@@ -119,13 +136,6 @@ def main():
     metadata_dict = {
         str(m.get("Legislator", "")).strip(): m for m in metadata_list if m.get("Legislator")
     }
-
-    drive_service = None
-    if DRIVE_REPORTS_FOLDER_ID:
-        try:
-            drive_service = init_google_drive_service()
-        except Exception as e:
-            print(f"Warning: Google Drive client initialization failed: {e}")
 
     output_dir = "generated_reports"
     os.makedirs(output_dir, exist_ok=True)
@@ -144,14 +154,13 @@ def main():
 
         metadata = metadata_dict.get(legislator_name, {})
 
-        # FIX 1: Use placeholder image when Image_URL is missing instead of skipping
         image_url = metadata.get("Image_URL")
         if not image_url or str(image_url).strip().lower() in ["nan", "none", ""]:
             image_url = DEFAULT_PLACEHOLDER_IMAGE
 
         metadata["Image_URL"] = image_url
 
-        # Pass full profile dictionary as context so your Jinja template variables render properly
+        # Build combined context dictionary matching template variable keys
         context = {
             "legislator": profile,
             "metadata": metadata,
@@ -168,7 +177,6 @@ def main():
         print(f"Generated report for {legislator_name}: {pdf_path}")
         generated_count += 1
 
-        # FIX 2: Safe Drive upload with fallback creation
         if drive_service and DRIVE_REPORTS_FOLDER_ID:
             try:
                 upload_or_update_drive_file(
