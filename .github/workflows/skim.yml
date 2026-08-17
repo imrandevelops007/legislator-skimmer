@@ -35,11 +35,12 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: 'gemini-3.6-flash'
           DRY_RUN: 'false'
-          BATCH_SIZE: 1
-          MAX_ITEMS_PER_RUN: 2
+          BATCH_SIZE: 5
+          # Increased from 2 to 500 so analyze.py reaches rows 358-407
+          MAX_ITEMS_PER_RUN: 500
           MAX_PAGE_CHARS: 2500
           GEMINI_MAX_RETRIES: 3
-          REQUEST_DELAY_SECONDS: 15
+          REQUEST_DELAY_SECONDS: 2
           STOP_ON_QUOTA_EXHAUSTION: 'true'
           REPAIR_MISSING_BILL_NUMBERS: 'true'
         run: python analyze.py
