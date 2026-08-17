@@ -4,6 +4,8 @@ import re
 import jinja2
 from weasyprint import HTML
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 
 # Configuration loaded from environment variables
@@ -17,7 +19,7 @@ OVERWRITE_EXISTING_IN_TARGET_FOLDER = (
 )
 ONLY_LEGISLATOR = os.getenv("ONLY_LEGISLATOR", "").strip()
 
-# Default placeholder image URL used when Image_URL is missing in Legislator_Metadata
+# Default fallback image URL used when Image_URL is missing
 DEFAULT_PLACEHOLDER_IMAGE = "https://via.placeholder.com/150?text=No+Photo"
 
 
@@ -45,7 +47,6 @@ def init_google_services():
         creds = Credentials.from_service_account_info(info, scopes=scopes)
 
     drive_service = build("drive", "v3", credentials=creds)
-    # FIX: Changed "4" to "v4"
     sheets_service = build("sheets", "v4", credentials=creds)
     return drive_service, sheets_service
 
@@ -73,36 +74,40 @@ def fetch_sheet_records(sheets_service, sheet_id, range_name):
 
 
 def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
-    """Upload a PDF report to Google Drive or update it if it already exists."""
+    """Upload a PDF report to Google Drive or overwrite it in the existing folder."""
     query = f"'{folder_id}' in parents and name = '{file_name}' and trashed = false"
     response = drive_service.files().list(q=query, fields="files(id, name)").execute()
     files = response.get("files", [])
 
-    from googleapiclient.http import MediaFileUpload
-
     media = MediaFileUpload(file_path, mimetype="application/pdf", resumable=True)
 
+    # Attempt update if file exists
     if files and OVERWRITE_EXISTING_IN_TARGET_FOLDER:
         file_id = files[0]["id"]
-        print(f"Updating existing Drive file in target folder: {file_name} ({file_id})")
-        updated_file = (
-            drive_service.files()
-            .update(fileId=file_id, media_body=media, fields="id, webViewLink")
-            .execute()
-        )
-        print(f"Updated in Drive: {file_name} ({updated_file.get('id')})")
-        print(f"Drive link: {updated_file.get('webViewLink')}")
-        return updated_file.get("webViewLink")
-    else:
-        file_metadata = {"name": file_name, "parents": [folder_id]}
-        created_file = (
-            drive_service.files()
-            .create(body=file_metadata, media_body=media, fields="id, webViewLink")
-            .execute()
-        )
-        print(f"Uploaded to Drive: {file_name} ({created_file.get('id')})")
-        print(f"Drive link: {created_file.get('webViewLink')}")
-        return created_file.get("webViewLink")
+        try:
+            print(f"Updating existing Drive file: {file_name} ({file_id})")
+            updated_file = (
+                drive_service.files()
+                .update(fileId=file_id, media_body=media, fields="id, webViewLink")
+                .execute()
+            )
+            print(f"Updated in Drive: {file_name}")
+            return updated_file.get("webViewLink")
+        except HttpError as e:
+            if e.resp.status == 404:
+                print(f"File ID {file_id} not writable by Service Account. Re-uploading into target folder...")
+            else:
+                raise e
+
+    # Fallback to creating/uploading into target folder
+    file_metadata = {"name": file_name, "parents": [folder_id]}
+    created_file = (
+        drive_service.files()
+        .create(body=file_metadata, media_body=media, fields="id, webViewLink")
+        .execute()
+    )
+    print(f"Uploaded to Drive: {file_name} ({created_file.get('id')})")
+    return created_file.get("webViewLink")
 
 
 def main():
@@ -123,7 +128,7 @@ def main():
     ]
     print(f"Loaded processed profile rows: {len(processed_profiles)}")
 
-    # Configure Jinja2 environment to search search_paths
+    # Configure Jinja2 environment
     search_paths = [TEMPLATE_DIR, ".", "templates"]
     template_loader = jinja2.FileSystemLoader(searchpath=search_paths)
     jinja_env = jinja2.Environment(loader=template_loader)
