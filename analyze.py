@@ -6,10 +6,14 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from google import genai
+
+# Suppress SSL insecure request warnings when verify=False is used
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # =========================
@@ -173,7 +177,8 @@ def fetch_page_text(url: str) -> str:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
         )
     }
-    response = requests.get(url, headers=headers, timeout=30)
+    # verify=False handles SSL certificate verification issues on Michigan Legislature URLs
+    response = requests.get(url, headers=headers, timeout=30, verify=False)
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -520,7 +525,6 @@ def main():
             derived_bill_number = choose_bill_number(url, page_text, raw_title) or existing_bill_number
             cleaned_title = strip_bill_number_prefix_from_title(raw_title, derived_bill_number)
 
-            # fallback if title got stripped to empty
             if not cleaned_title:
                 cleaned_title = raw_title or "Untitled legislative item"
 
