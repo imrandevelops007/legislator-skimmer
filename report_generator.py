@@ -2,7 +2,6 @@ import json
 import os
 import re
 import jinja2
-import gspread
 from weasyprint import HTML
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
