@@ -95,11 +95,11 @@ def upload_or_update_drive_file(drive_service, file_path, file_name, folder_id):
             return updated_file.get("webViewLink")
         except HttpError as e:
             if e.resp.status in [403, 404]:
-                print(f"File ID {file_id} not writable or found ({e.resp.status}). Creating fresh file in target folder...")
+                print(f"File ID {file_id} not writable/found ({e.resp.status}). Uploading fresh file into target folder...")
             else:
                 raise e
 
-    # Fallback: Create/upload new file into target folder
+    # Fallback: Create new file directly in target folder
     file_metadata = {"name": file_name, "parents": [folder_id]}
     created_file = (
         drive_service.files()
