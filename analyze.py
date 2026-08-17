@@ -1,7 +1,6 @@
 import json
 import os
 import time
-import pandas as pd
 from google import genai
 from google.genai import errors
 
