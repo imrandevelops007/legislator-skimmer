@@ -10,8 +10,8 @@ SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-FALLBACK_GEMINI_MODELS = os.getenv("FALLBACK_GEMINI_MODELS", "gemini-3.5-flash,gemini-3.5-flash-lite").split(",")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+FALLBACK_GEMINI_MODELS = os.getenv("FALLBACK_GEMINI_MODELS", "gemini-1.5-flash").split(",")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def get_sheets_service():
@@ -41,7 +41,7 @@ def generate_profile_with_fallbacks(client, prompt):
             return response.text
         except errors.APIError as e:
             print(f"Failed with model {model_name}: {e}")
-            time.sleep(5)
+            time.sleep(12)
     raise RuntimeError("All configured Gemini models failed during profile generation.")
 
 def build_profiles():
@@ -129,9 +129,13 @@ def build_profiles():
                 ).execute()
 
                 print(f"Successfully updated profile for {leg_name}")
+                time.sleep(12)
 
             except Exception as e:
                 print(f"Failed to build profile for {leg_name}: {e}")
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    print("Stopping profile generation due to rate limits.")
+                    break
 
     print("Profile builder complete.")
 
