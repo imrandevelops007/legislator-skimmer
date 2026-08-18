@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import time
+import requests
 from google import genai
 from google.genai import errors
 from google.oauth2.service_account import Credentials
@@ -34,6 +36,15 @@ def init_gemini_client():
         raise ValueError("GEMINI_API_KEY environment variable is missing.")
     return genai.Client(api_key=GEMINI_API_KEY)
 
+def extract_bill_from_url(url):
+    """Fallback helper to pull bill number directly from URL if website fetch times out."""
+    match = re.search(r"objectName=\d+-([A-Z]+)-(\d+)", url, re.IGNORECASE)
+    if match:
+        bill_type = match.group(1).upper()
+        bill_num = match.group(2).lstrip("0")
+        return f"{bill_type} {bill_num}"
+    return ""
+
 def call_gemini_with_retry(client, prompt, model_name=GEMINI_MODEL, max_retries=GEMINI_MAX_RETRIES):
     for attempt in range(1, max_retries + 1):
         try:
@@ -45,7 +56,7 @@ def call_gemini_with_retry(client, prompt, model_name=GEMINI_MODEL, max_retries=
         except errors.APIError as e:
             err_str = str(e)
             if "404" in err_str or "NOT_FOUND" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                print(f"API issue encountered ({e}). Halting retries.")
+                print(f"API quota/availability issue ({e}). Halting Gemini retries.")
                 raise e
             print(f"Gemini failed attempt {attempt}/{max_retries}: {e}")
             if attempt < max_retries:
@@ -54,11 +65,19 @@ def call_gemini_with_retry(client, prompt, model_name=GEMINI_MODEL, max_retries=
                 raise e
 
 def analyze_activity_item(client, url, legislator_name):
-    prompt = f"""
-    Analyze the following legislative activity item URL for Michigan legislator {legislator_name}:
-    {url}
+    # Fast extraction directly from URL
+    fallback_bill = extract_bill_from_url(url)
     
-    Extract the Bill Number (e.g., HB 4001, SB 0123), Bill Title, and a concise 2-sentence summary of the bill's objectives.
+    prompt = f"""
+    Analyze the following Michigan legislative activity item URL for legislator {legislator_name}:
+    URL: {url}
+    Inferred Bill Number: {fallback_bill}
+    
+    Extract or confirm:
+    1. "bill_number": (e.g. HB 4001, SB 0123)
+    2. "bill_title": A brief title describing the bill.
+    3. "bill_summary": A concise 2-sentence summary of the bill's objectives.
+
     Return ONLY a raw valid JSON object with keys: "bill_number", "bill_title", "bill_summary".
     Do not include markdown code block formatting.
     """
@@ -101,7 +120,7 @@ def main():
         print(f"Analyzing row {idx + 2}: {url} for {legislator}")
         try:
             analysis = analyze_activity_item(client, url, legislator)
-            bill_num = analysis.get("bill_number", "")
+            bill_num = analysis.get("bill_number", "") or extract_bill_from_url(url)
             bill_title = analysis.get("bill_title", "")
             bill_summary = analysis.get("bill_summary", "")
 
@@ -124,13 +143,14 @@ def main():
                 ).execute()
 
             processed_count += 1
+            print(f"Successfully processed row {idx + 2}: {bill_num}")
             time.sleep(REQUEST_DELAY_SECONDS)
 
         except Exception as e:
             print(f"Error processing row {idx + 2}: {e}")
             err_str = str(e)
             if "404" in err_str or "NOT_FOUND" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                print("Stopping analysis loop immediately due to model availability or rate limit quota.")
+                print("Stopping analysis loop immediately due to model error or quota limits.")
                 break
 
     print(f"Analysis complete. Enriched {processed_count} rows.")
