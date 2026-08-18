@@ -11,7 +11,7 @@ SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "15"))
@@ -43,8 +43,9 @@ def call_gemini_with_retry(client, prompt, model_name=GEMINI_MODEL, max_retries=
             )
             return response.text
         except errors.APIError as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                print(f"Quota exhausted error encountered: {e}")
+            err_str = str(e)
+            if "404" in err_str or "NOT_FOUND" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                print(f"API issue encountered ({e}). Halting retries.")
                 raise e
             print(f"Gemini failed attempt {attempt}/{max_retries}: {e}")
             if attempt < max_retries:
@@ -127,8 +128,9 @@ def main():
 
         except Exception as e:
             print(f"Error processing row {idx + 2}: {e}")
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                print("Stopping analysis due to Gemini API rate limit / quota exhaustion.")
+            err_str = str(e)
+            if "404" in err_str or "NOT_FOUND" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                print("Stopping analysis loop immediately due to model availability or rate limit quota.")
                 break
 
     print(f"Analysis complete. Enriched {processed_count} rows.")
