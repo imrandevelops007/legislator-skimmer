@@ -36,7 +36,7 @@ jobs:
           GEMINI_MODEL: 'gemini-3.6-flash'
           DRY_RUN: 'false'
           BATCH_SIZE: 5
-          MAX_ITEMS_PER_RUN: 30
+          MAX_ITEMS_PER_RUN: 300
           MAX_PAGE_CHARS: 2500
           GEMINI_MAX_RETRIES: 2
           REQUEST_DELAY_SECONDS: 5
